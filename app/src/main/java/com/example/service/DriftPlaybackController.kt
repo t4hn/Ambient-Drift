@@ -4,9 +4,11 @@ import android.content.Context
 import android.content.Intent
 import android.os.SystemClock
 import androidx.core.content.ContextCompat
+import com.example.audio.AudioFocusClient
 import com.example.audio.AudioFocusHelper
 import com.example.audio.AudioFocusListener
 import com.example.audio.DriftAudioMixerEngine
+import com.example.audio.FocusRequestOutcome
 import com.example.audio.WavStemLoader
 import com.example.data.PreferencesStorage
 import com.example.model.AudioSourceOrigin
@@ -29,6 +31,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 class DriftPlaybackController(
@@ -51,9 +55,13 @@ class DriftPlaybackController(
     private var sleepTimerJob: Job? = null
     private var persistVolumeJob: Job? = null
     private var persistMasterVolumeJob: Job? = null
+    private var sceneLoadJob: Job? = null
+    private var transitionResetJob: Job? = null
+    private val sceneLoadMutex = Mutex()
+    private var sceneGeneration = 0L
     private var stateChangeListener: (() -> Unit)? = null
 
-    private val audioFocusHelper: AudioFocusHelper? = if (enableAndroidServiceBridge) {
+    internal var audioFocusClient: AudioFocusClient? = if (enableAndroidServiceBridge) {
         AudioFocusHelper(appContext, this)
     } else {
         null
@@ -125,6 +133,9 @@ class DriftPlaybackController(
             return
         }
 
+        val targetGeneration = ++sceneGeneration
+        transitionResetJob?.cancel()
+
         val prefs = cachedPrefs
         val newChannels = buildChannelsForScene(targetScene, prefs)
         val wasPlaying = current.isPlayingOrFading
@@ -140,17 +151,23 @@ class DriftPlaybackController(
             )
         }
 
-        scope.launch {
-            withContext(Dispatchers.IO) {
-                preferences.setLastSceneId(targetScene.id)
-                mixerEngine.loadScene(
-                    scene = targetScene,
-                    channelStates = newChannels,
-                    masterVolume = _uiState.value.masterVolume,
-                    crossfade = crossfade,
-                    isCurrentlyPlaying = wasPlaying
-                )
+        sceneLoadJob?.cancel()
+        sceneLoadJob = scope.launch {
+            sceneLoadMutex.withLock {
+                if (targetGeneration != sceneGeneration || !isActive) return@withLock
+                withContext(Dispatchers.IO) {
+                    preferences.setLastSceneId(targetScene.id)
+                    mixerEngine.loadScene(
+                        scene = targetScene,
+                        channelStates = newChannels,
+                        masterVolume = _uiState.value.masterVolume,
+                        crossfade = crossfade,
+                        isCurrentlyPlaying = wasPlaying
+                    )
+                }
             }
+
+            if (targetGeneration != sceneGeneration || !isActive) return@launch
 
             if (shouldPlay && !wasPlaying) {
                 playAll()
@@ -159,8 +176,12 @@ class DriftPlaybackController(
             }
 
             if (crossfade) {
-                delay(1250L)
-                _uiState.update { it.copy(isTransitioning = false) }
+                transitionResetJob = scope.launch {
+                    delay(1250L)
+                    if (targetGeneration == sceneGeneration) {
+                        _uiState.update { it.copy(isTransitioning = false) }
+                    }
+                }
             }
         }
     }
@@ -177,12 +198,18 @@ class DriftPlaybackController(
             state.channels
         }
 
-        val focusGranted = audioFocusHelper?.requestFocus() ?: true
-        if (!focusGranted) {
-            return
+        when (audioFocusClient?.requestFocus() ?: FocusRequestOutcome.GRANTED) {
+            FocusRequestOutcome.GRANTED -> {
+                resumeOnAudioFocusGain = false
+            }
+            FocusRequestOutcome.DELAYED -> {
+                resumeOnAudioFocusGain = true
+                return
+            }
+            FocusRequestOutcome.FAILED -> {
+                return
+            }
         }
-
-        resumeOnAudioFocusGain = false
 
         // If we were fading out from a sleep timer, cancel the fade and reset timer if expired
         if (state.playbackStatus == PlaybackStatus.FADING_OUT) {
@@ -207,33 +234,47 @@ class DriftPlaybackController(
             }
         }
 
+        val playGeneration = sceneGeneration
         scope.launch {
-            withContext(Dispatchers.IO) {
-                // Ensure scene stems are loaded before starting mixer
-                mixerEngine.loadScene(
-                    scene = activeScene,
-                    channelStates = updatedChannels,
-                    masterVolume = _uiState.value.masterVolume,
-                    crossfade = false,
-                    isCurrentlyPlaying = false
-                )
-                mixerEngine.updateChannelStates(updatedChannels)
-                mixerEngine.setMasterVolume(_uiState.value.masterVolume)
-                mixerEngine.startPlayback()
+            var started = false
+            sceneLoadMutex.withLock {
+                val currentState = _uiState.value
+                if (!currentState.isPlayingOrFading || playGeneration != sceneGeneration) {
+                    return@withLock
+                }
+                val sceneToPlay = currentState.activeScene ?: activeScene
+                val channelsToPlay = currentState.channels
+                val volumeToPlay = currentState.masterVolume
+                withContext(Dispatchers.IO) {
+                    // Ensure scene stems are loaded before starting mixer
+                    mixerEngine.loadScene(
+                        scene = sceneToPlay,
+                        channelStates = channelsToPlay,
+                        masterVolume = volumeToPlay,
+                        crossfade = false,
+                        isCurrentlyPlaying = false
+                    )
+                    mixerEngine.updateChannelStates(channelsToPlay)
+                    mixerEngine.setMasterVolume(volumeToPlay)
+                    mixerEngine.startPlayback()
+                }
+                started = true
             }
-            startMediaServiceIfNeeded()
-            notifyMediaSession()
+            if (started) {
+                startMediaServiceIfNeeded()
+                notifyMediaSession()
+            }
         }
     }
 
     fun pauseAll(fromAudioFocus: Boolean = false) {
+        if (!fromAudioFocus) {
+            resumeOnAudioFocusGain = false
+            audioFocusClient?.abandonFocus()
+        }
         val state = _uiState.value
         if (state.playbackStatus == PlaybackStatus.PAUSED || state.playbackStatus == PlaybackStatus.STOPPED) {
             return
-        }
-        if (!fromAudioFocus) {
-            resumeOnAudioFocusGain = false
-            audioFocusHelper?.abandonFocus()
         }
 
         _uiState.update { it.copy(playbackStatus = PlaybackStatus.PAUSED) }
@@ -243,8 +284,9 @@ class DriftPlaybackController(
 
     fun stopAll() {
         resumeOnAudioFocusGain = false
+        transitionResetJob?.cancel()
         cancelSleepTimerInternal(clearFade = true)
-        audioFocusHelper?.abandonFocus()
+        audioFocusClient?.abandonFocus()
 
         _uiState.update {
             it.copy(
@@ -502,6 +544,8 @@ class DriftPlaybackController(
         if (_uiState.value.isPlayingOrFading) {
             resumeOnAudioFocusGain = transient
             pauseAll(fromAudioFocus = true)
+        } else if (!transient) {
+            resumeOnAudioFocusGain = false
         }
     }
 
@@ -511,17 +555,20 @@ class DriftPlaybackController(
 
     override fun onAudioFocusGained() {
         mixerEngine.setDucking(false)
-        if (resumeOnAudioFocusGain && _uiState.value.playbackStatus == PlaybackStatus.PAUSED) {
+        val status = _uiState.value.playbackStatus
+        if (resumeOnAudioFocusGain && (status == PlaybackStatus.PAUSED || status == PlaybackStatus.STOPPED)) {
             resumeOnAudioFocusGain = false
             playAll()
         }
     }
 
     fun release() {
+        sceneLoadJob?.cancel()
+        transitionResetJob?.cancel()
         sleepTimerJob?.cancel()
         persistVolumeJob?.cancel()
         persistMasterVolumeJob?.cancel()
-        audioFocusHelper?.abandonFocus()
+        audioFocusClient?.abandonFocus()
         mixerEngine.release()
     }
 

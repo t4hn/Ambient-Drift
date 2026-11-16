@@ -6,6 +6,17 @@ import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.os.Build
 
+enum class FocusRequestOutcome {
+    GRANTED,
+    DELAYED,
+    FAILED
+}
+
+interface AudioFocusClient {
+    fun requestFocus(): FocusRequestOutcome
+    fun abandonFocus()
+}
+
 interface AudioFocusListener {
     fun onAudioFocusLost(transient: Boolean)
     fun onAudioFocusDuck(duck: Boolean)
@@ -15,7 +26,7 @@ interface AudioFocusListener {
 class AudioFocusHelper(
     context: Context,
     private val listener: AudioFocusListener
-) {
+) : AudioFocusClient {
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private var focusRequest: AudioFocusRequest? = null
     private var hasFocus = false
@@ -41,8 +52,8 @@ class AudioFocusHelper(
         }
     }
 
-    fun requestFocus(): Boolean {
-        if (hasFocus) return true
+    override fun requestFocus(): FocusRequestOutcome {
+        if (hasFocus) return FocusRequestOutcome.GRANTED
 
         val result = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val attrs = AudioAttributes.Builder()
@@ -66,11 +77,23 @@ class AudioFocusHelper(
             )
         }
 
-        hasFocus = (result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED)
-        return hasFocus
+        return when (result) {
+            AudioManager.AUDIOFOCUS_REQUEST_GRANTED -> {
+                hasFocus = true
+                FocusRequestOutcome.GRANTED
+            }
+            AudioManager.AUDIOFOCUS_REQUEST_DELAYED -> {
+                hasFocus = false
+                FocusRequestOutcome.DELAYED
+            }
+            else -> {
+                hasFocus = false
+                FocusRequestOutcome.FAILED
+            }
+        }
     }
 
-    fun abandonFocus() {
+    override fun abandonFocus() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             focusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
             focusRequest = null

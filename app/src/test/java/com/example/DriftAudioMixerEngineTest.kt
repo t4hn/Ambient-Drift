@@ -169,6 +169,35 @@ class DriftAudioMixerEngineTest {
         engine.release()
     }
 
+    @Test
+    fun `softLimit is continuous, monotonic, and passes through below threshold across -2 to 2`() {
+        val engine = createTestEngine { _, _ -> constantStem(0f, frames = 64) }
+        val step = 0.001f
+        val epsilon = 0.002f
+        val threshold = 0.85f
+
+        var x = -2.0f
+        var prev = engine.softLimit(x)
+        assertTrue("Expected softLimit(-2) > -1.0f, was $prev", prev > -1.0f)
+
+        val steps = 4000
+        for (i in 1..steps) {
+            x = -2.0f + i * step
+            val curr = engine.softLimit(x)
+            val jump = abs(curr - prev)
+
+            assertTrue("Expected output within (-1, 1) at x=$x, got $curr", curr > -1.0f && curr < 1.0f)
+            assertTrue("Expected monotonic output at x=$x: prev=$prev, curr=$curr", curr >= prev)
+            assertTrue("Discontinuity detected at x=$x: prev=$prev, curr=$curr, jump=$jump", jump < epsilon)
+
+            if (abs(x) <= threshold) {
+                assertEquals("Expected pass-through inside [-0.85, 0.85] at x=$x", x, curr, 1e-6f)
+            }
+            prev = curr
+        }
+        engine.release()
+    }
+
     private fun createTestEngine(stemLoader: StemLoader): DriftAudioMixerEngine {
         return DriftAudioMixerEngine(
             stemLoader = stemLoader,

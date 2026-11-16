@@ -3,8 +3,12 @@ package com.example
 import android.content.Context
 import android.os.Looper
 import androidx.test.core.app.ApplicationProvider
+import com.example.audio.AudioFocusClient
 import com.example.audio.AudioOutputSink
+import com.example.audio.AudioStem
 import com.example.audio.DriftAudioMixerEngine
+import com.example.audio.FocusRequestOutcome
+import com.example.audio.StemLoader
 import com.example.audio.WavStemLoader
 import com.example.data.DriftPreferencesRepository
 import com.example.model.AudioSourceOrigin
@@ -22,6 +26,8 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 
+import java.time.Duration
+
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [36])
 class DriftControllerAndPersistenceTest {
@@ -32,6 +38,7 @@ class DriftControllerAndPersistenceTest {
             shadowOf(Looper.getMainLooper()).idle()
             if (condition()) return
             delay(50)
+            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(50))
         }
         shadowOf(Looper.getMainLooper()).idle()
     }
@@ -143,6 +150,150 @@ class DriftControllerAndPersistenceTest {
         controller.stopAll()
         awaitUntil { controller.uiState.value.playbackStatus == PlaybackStatus.STOPPED }
         assertEquals(PlaybackStatus.STOPPED, controller.uiState.value.playbackStatus)
+        controller.release()
+    }
+
+    @Test
+    fun `delayed and failed audio focus handles pending play and cancellation cleanly`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val repo = DriftPreferencesRepository(context)
+        val noopEngine = DriftAudioMixerEngine(
+            stemLoader = StemLoader { _, _ ->
+                AudioStem(FloatArray(512) { 0.1f }, FloatArray(512) { 0.1f }, DriftAudioMixerEngine.SAMPLE_RATE)
+            },
+            sinkFactory = {
+                object : AudioOutputSink {
+                    override fun start() {}
+                    override fun write(pcm16Stereo: ShortArray, shortCount: Int): Int = shortCount
+                    override fun pauseAndFlush() {}
+                    override fun release() {}
+                }
+            }
+        )
+
+        var nextOutcome = FocusRequestOutcome.FAILED
+        var abandonCount = 0
+        val fakeFocusClient = object : AudioFocusClient {
+            override fun requestFocus(): FocusRequestOutcome = nextOutcome
+            override fun abandonFocus() {
+                abandonCount++
+            }
+        }
+
+        val controller = DriftPlaybackController(
+            appContext = context,
+            preferences = repo,
+            mixerEngine = noopEngine,
+            enableAndroidServiceBridge = false
+        ).apply {
+            audioFocusClient = fakeFocusClient
+        }
+        awaitUntil { controller.uiState.value.activeScene != null }
+
+        // FAILED leaves playback STOPPED and gain does not start playback
+        nextOutcome = FocusRequestOutcome.FAILED
+        controller.playAll()
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(PlaybackStatus.STOPPED, controller.uiState.value.playbackStatus)
+
+        controller.onAudioFocusGained()
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(PlaybackStatus.STOPPED, controller.uiState.value.playbackStatus)
+
+        // DELAYED keeps UI state STOPPED, then starts when focus is later granted
+        nextOutcome = FocusRequestOutcome.DELAYED
+        controller.playAll()
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(PlaybackStatus.STOPPED, controller.uiState.value.playbackStatus)
+
+        nextOutcome = FocusRequestOutcome.GRANTED
+        controller.onAudioFocusGained()
+        awaitUntil { controller.uiState.value.playbackStatus == PlaybackStatus.PLAYING }
+        assertEquals(PlaybackStatus.PLAYING, controller.uiState.value.playbackStatus)
+
+        // Stop, request DELAYED again, then cancel via pauseAll() -> late gain must NOT start playback
+        controller.stopAll()
+        awaitUntil { controller.uiState.value.playbackStatus == PlaybackStatus.STOPPED }
+
+        nextOutcome = FocusRequestOutcome.DELAYED
+        controller.playAll()
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(PlaybackStatus.STOPPED, controller.uiState.value.playbackStatus)
+
+        val abandonsBeforePause = abandonCount
+        controller.pauseAll()
+        assertTrue(abandonCount > abandonsBeforePause)
+
+        nextOutcome = FocusRequestOutcome.GRANTED
+        controller.onAudioFocusGained()
+        delay(100)
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(PlaybackStatus.STOPPED, controller.uiState.value.playbackStatus)
+
+        // Also verify stopAll() cancels pending delayed focus
+        nextOutcome = FocusRequestOutcome.DELAYED
+        controller.playAll()
+        controller.stopAll()
+        nextOutcome = FocusRequestOutcome.GRANTED
+        controller.onAudioFocusGained()
+        delay(100)
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(PlaybackStatus.STOPPED, controller.uiState.value.playbackStatus)
+
+        controller.release()
+    }
+
+    @Test
+    fun `rapid scene switching settles on last selected scene and clears isTransitioning`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val repo = DriftPreferencesRepository(context)
+        val fakeStemLoader = StemLoader { _, _ ->
+            Thread.sleep(25)
+            AudioStem(FloatArray(512) { 0.15f }, FloatArray(512) { 0.15f }, DriftAudioMixerEngine.SAMPLE_RATE)
+        }
+        val fakeSinkEngine = DriftAudioMixerEngine(
+            stemLoader = fakeStemLoader,
+            sinkFactory = {
+                object : AudioOutputSink {
+                    override fun start() {}
+                    override fun write(pcm16Stereo: ShortArray, shortCount: Int): Int = shortCount
+                    override fun pauseAndFlush() {}
+                    override fun release() {}
+                }
+            }
+        )
+
+        val controller = DriftPlaybackController(
+            appContext = context,
+            preferences = repo,
+            mixerEngine = fakeSinkEngine,
+            enableAndroidServiceBridge = false
+        )
+        awaitUntil { controller.uiState.value.activeScene != null }
+
+        // Start playing so rapid scene switches exercise active crossfades
+        controller.selectScene(SceneCatalog.SCENE_STORM_ID, autoStartIfConfigured = true)
+        controller.playAll()
+        awaitUntil { controller.uiState.value.playbackStatus == PlaybackStatus.PLAYING }
+
+        val rapidSequence = listOf(
+            SceneCatalog.SCENE_DEEP_SPACE_ID,
+            SceneCatalog.SCENE_ABYSS_ID,
+            SceneCatalog.SCENE_STORM_ID,
+            SceneCatalog.SCENE_DEEP_SPACE_ID,
+            SceneCatalog.SCENE_ABYSS_ID
+        )
+        rapidSequence.forEach { sceneId ->
+            controller.selectScene(sceneId, autoStartIfConfigured = true)
+        }
+
+        awaitUntil(timeoutMs = 3500L) {
+            controller.uiState.value.activeScene?.id == SceneCatalog.SCENE_ABYSS_ID &&
+                !controller.uiState.value.isTransitioning
+        }
+
+        assertEquals(SceneCatalog.SCENE_ABYSS_ID, controller.uiState.value.activeScene?.id)
+        assertFalse("Expected isTransitioning to return to false", controller.uiState.value.isTransitioning)
         controller.release()
     }
 }

@@ -7,6 +7,7 @@ import android.os.Process
 import com.example.model.AudioChannelSpec
 import com.example.model.ChannelState
 import com.example.model.SceneSpec
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.PI
 import kotlin.math.cos
@@ -128,7 +129,8 @@ class DriftAudioMixerEngine(
     )
 
     private val lock = Any()
-    private val stemCache = HashMap<Int, AudioStem>()
+    private val stemLoadLock = Any()
+    private val stemCache = ConcurrentHashMap<Int, AudioStem>()
 
     private var activeBus: SceneBus? = null
     private val outgoingBuses = mutableListOf<SceneBus>()
@@ -163,9 +165,11 @@ class DriftAudioMixerEngine(
         crossfade: Boolean,
         isCurrentlyPlaying: Boolean
     ) {
-        val loadedStems = scene.channels.associate { ch ->
-            ch.rawResId to (stemCache[ch.rawResId] ?: stemLoader.loadStem(ch.rawResId, SAMPLE_RATE)
-                .also { stemCache[ch.rawResId] = it })
+        val loadedStems = synchronized(stemLoadLock) {
+            scene.channels.associate { ch ->
+                ch.rawResId to (stemCache[ch.rawResId] ?: stemLoader.loadStem(ch.rawResId, SAMPLE_RATE)
+                    .also { stemCache[ch.rawResId] = it })
+            }
         }
 
         val stateMap = channelStates.associateBy { it.spec.id }
@@ -298,8 +302,10 @@ class DriftAudioMixerEngine(
         synchronized(lock) {
             activeBus = null
             outgoingBuses.clear()
-            stemCache.clear()
             onFadeOutCompleted = null
+        }
+        synchronized(stemLoadLock) {
+            stemCache.clear()
         }
     }
 
@@ -470,11 +476,19 @@ class DriftAudioMixerEngine(
         }
     }
 
-    private fun softLimit(sample: Float): Float {
-        return if (sample > 0.85f || sample < -0.85f) {
-            tanh(sample.toDouble()).toFloat()
-        } else {
-            sample
+    internal fun softLimit(sample: Float): Float {
+        val threshold = 0.85f
+        val headroom = 1.0f - threshold
+        return when {
+            sample > threshold -> {
+                val over = (sample - threshold) / headroom
+                threshold + headroom * tanh(over.toDouble()).toFloat()
+            }
+            sample < -threshold -> {
+                val over = (-sample - threshold) / headroom
+                -(threshold + headroom * tanh(over.toDouble()).toFloat())
+            }
+            else -> sample
         }
     }
 }
