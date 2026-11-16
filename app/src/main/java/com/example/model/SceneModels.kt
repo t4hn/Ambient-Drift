@@ -60,7 +60,8 @@ data class SleepTimerState(
     val selectedPreset: SleepTimerPreset? = null,
     val totalSeconds: Int = 0,
     val remainingSeconds: Int = 0,
-    val isFadingOut: Boolean = false
+    val isFadingOut: Boolean = false,
+    val isPaused: Boolean = false
 )
 
 data class UserPreferences(

@@ -21,6 +21,7 @@ import com.example.model.SceneSpec
 import com.example.model.SleepTimerPreset
 import com.example.model.SleepTimerState
 import com.example.model.UserPreferences
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -40,7 +41,10 @@ class DriftPlaybackController(
     private val appContext: Context,
     private val preferences: PreferencesStorage,
     private val mixerEngine: DriftAudioMixerEngine = DriftAudioMixerEngine(WavStemLoader(appContext)),
-    private val enableAndroidServiceBridge: Boolean = true
+    private val enableAndroidServiceBridge: Boolean = true,
+    private val elapsedRealtimeMs: () -> Long = { SystemClock.elapsedRealtime() },
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val mainDispatcher: CoroutineDispatcher = Dispatchers.Main.immediate
 ) : AudioFocusListener {
 
     companion object {
@@ -48,13 +52,17 @@ class DriftPlaybackController(
         const val SLEEP_FADE_DURATION_SECONDS = 8.0f
     }
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val scope = CoroutineScope(SupervisorJob() + mainDispatcher)
 
     private var cachedPrefs: UserPreferences? = null
     @Volatile
     private var hasUserInteracted = false
     private var resumeOnAudioFocusGain = false
     private var sleepTimerJob: Job? = null
+    private var sleepTimerGeneration = 0L
+    private var timerRemainingMs: Long = 0L
+    private var timerEndTimeMs: Long? = null
+    private var activeTimerFadeDurationSeconds: Float = SLEEP_FADE_DURATION_SECONDS
     private var persistVolumeJob: Job? = null
     private var persistMasterVolumeJob: Job? = null
     private var sceneLoadJob: Job? = null
@@ -95,7 +103,7 @@ class DriftPlaybackController(
             }
         }
         scope.launch {
-            val loaded = withContext(Dispatchers.IO) {
+            val loaded = withContext(ioDispatcher) {
                 preferences.readInitialPreferences()
             }
             cachedPrefs = loaded
@@ -115,7 +123,7 @@ class DriftPlaybackController(
                         hasTestAudioStems = scene.channels.any { ch -> ch.sourceOrigin == AudioSourceOrigin.SYNTHESIZED_TEST }
                     )
                 }
-                withContext(Dispatchers.IO) {
+                withContext(ioDispatcher) {
                     mixerEngine.loadScene(
                         scene = scene,
                         channelStates = channels,
@@ -166,7 +174,7 @@ class DriftPlaybackController(
         sceneLoadJob = scope.launch {
             sceneLoadMutex.withLock {
                 if (targetGeneration != sceneGeneration || !isActive) return@withLock
-                withContext(Dispatchers.IO) {
+                withContext(ioDispatcher) {
                     preferences.setLastSceneId(targetScene.id)
                     mixerEngine.loadScene(
                         scene = targetScene,
@@ -198,9 +206,14 @@ class DriftPlaybackController(
     }
 
     fun playAll() {
+        playAllInternal()
+    }
+
+    private fun playAllInternal(): Boolean {
         hasUserInteracted = true
         val state = _uiState.value
         val activeScene = state.activeScene ?: SceneCatalog.defaultScene
+        val wasStopped = state.playbackStatus == PlaybackStatus.STOPPED
 
         // Ensure at least channels are ready if all channels were individually paused
         val updatedChannels = if (state.channels.none { it.isPlaying }) {
@@ -212,19 +225,23 @@ class DriftPlaybackController(
         when (audioFocusClient?.requestFocus() ?: FocusRequestOutcome.GRANTED) {
             FocusRequestOutcome.GRANTED -> {
                 resumeOnAudioFocusGain = false
+                mixerEngine.setDucking(false)
             }
             FocusRequestOutcome.DELAYED -> {
                 resumeOnAudioFocusGain = true
-                return
+                return false
             }
             FocusRequestOutcome.FAILED -> {
-                return
+                return false
             }
         }
 
         // If we were fading out from a sleep timer, cancel the fade and reset timer if expired
         if (state.playbackStatus == PlaybackStatus.FADING_OUT) {
-            mixerEngine.cancelSleepFadeOut()
+            sleepTimerGeneration++
+            cancelSleepTimerInternal(clearFade = true)
+            timerRemainingMs = 0L
+            timerEndTimeMs = null
             _uiState.update {
                 it.copy(
                     sleepTimer = SleepTimerState()
@@ -240,8 +257,34 @@ class DriftPlaybackController(
         }
 
         if (updatedChannels !== state.channels) {
-            scope.launch(Dispatchers.IO) {
+            scope.launch(ioDispatcher) {
                 updatedChannels.forEach { ch -> preferences.setChannelPlaying(ch.spec.id, true) }
+            }
+        }
+
+        // Resume any paused sleep timer alongside playback
+        val activeTimer = _uiState.value.sleepTimer
+        if (activeTimer.isActive && activeTimer.isPaused) {
+            if (timerRemainingMs > 0L) {
+                val timerGen = ++sleepTimerGeneration
+                timerEndTimeMs = elapsedRealtimeMs() + timerRemainingMs
+                _uiState.update {
+                    it.copy(
+                        sleepTimer = it.sleepTimer.copy(
+                            isPaused = false,
+                            isFadingOut = false
+                        )
+                    )
+                }
+                launchSleepTimerLoop(timerGen, activeTimerFadeDurationSeconds)
+            } else {
+                val timerGen = ++sleepTimerGeneration
+                _uiState.update {
+                    it.copy(
+                        sleepTimer = it.sleepTimer.copy(isPaused = false)
+                    )
+                }
+                triggerSleepTimerExpiryFade(timerGen, activeTimerFadeDurationSeconds)
             }
         }
 
@@ -256,15 +299,17 @@ class DriftPlaybackController(
                 val sceneToPlay = currentState.activeScene ?: activeScene
                 val channelsToPlay = currentState.channels
                 val volumeToPlay = currentState.masterVolume
-                withContext(Dispatchers.IO) {
-                    // Ensure scene stems are loaded before starting mixer
-                    mixerEngine.loadScene(
-                        scene = sceneToPlay,
-                        channelStates = channelsToPlay,
-                        masterVolume = volumeToPlay,
-                        crossfade = false,
-                        isCurrentlyPlaying = false
-                    )
+                withContext(ioDispatcher) {
+                    // Load only when the target scene isn't loaded yet or starting fresh from STOPPED
+                    if (!mixerEngine.hasLoadedScene(sceneToPlay.id) || wasStopped) {
+                        mixerEngine.loadScene(
+                            scene = sceneToPlay,
+                            channelStates = channelsToPlay,
+                            masterVolume = volumeToPlay,
+                            crossfade = false,
+                            isCurrentlyPlaying = false
+                        )
+                    }
                     mixerEngine.updateChannelStates(channelsToPlay)
                     mixerEngine.setMasterVolume(volumeToPlay)
                     mixerEngine.startPlayback()
@@ -279,19 +324,53 @@ class DriftPlaybackController(
                 }
             }
         }
+        return true
     }
 
     fun pauseAll(fromAudioFocus: Boolean = false) {
         if (!fromAudioFocus) {
             resumeOnAudioFocusGain = false
             audioFocusClient?.abandonFocus()
+            mixerEngine.setDucking(false)
         }
         val state = _uiState.value
         if (state.playbackStatus == PlaybackStatus.PAUSED || state.playbackStatus == PlaybackStatus.STOPPED) {
             return
         }
 
-        _uiState.update { it.copy(playbackStatus = PlaybackStatus.PAUSED) }
+        var updatedTimer = state.sleepTimer
+        if (state.sleepTimer.isActive) {
+            sleepTimerGeneration++
+            val wasFading = state.sleepTimer.isFadingOut || state.playbackStatus == PlaybackStatus.FADING_OUT
+            if (wasFading) {
+                cancelSleepTimerInternal(clearFade = true)
+                timerRemainingMs = 0L
+                timerEndTimeMs = null
+                updatedTimer = state.sleepTimer.copy(
+                    isPaused = true,
+                    isFadingOut = false,
+                    remainingSeconds = 0
+                )
+            } else {
+                cancelSleepTimerInternal(clearFade = false)
+                val remaining = timerEndTimeMs?.let { (it - elapsedRealtimeMs()).coerceAtLeast(0L) }
+                    ?: timerRemainingMs
+                timerRemainingMs = remaining
+                timerEndTimeMs = null
+                updatedTimer = state.sleepTimer.copy(
+                    isPaused = true,
+                    isFadingOut = false,
+                    remainingSeconds = ((remaining + 999L) / 1000L).toInt()
+                )
+            }
+        }
+
+        _uiState.update {
+            it.copy(
+                playbackStatus = PlaybackStatus.PAUSED,
+                sleepTimer = updatedTimer
+            )
+        }
         mixerEngine.pauseOrStopPlayback()
         notifyMediaSession()
     }
@@ -299,8 +378,12 @@ class DriftPlaybackController(
     fun stopAll() {
         resumeOnAudioFocusGain = false
         transitionResetJob?.cancel()
+        sleepTimerGeneration++
         cancelSleepTimerInternal(clearFade = true)
+        timerRemainingMs = 0L
+        timerEndTimeMs = null
         audioFocusClient?.abandonFocus()
+        mixerEngine.setDucking(false)
 
         _uiState.update {
             it.copy(
@@ -327,7 +410,7 @@ class DriftPlaybackController(
         cachedPrefs = cachedPrefs?.copy(masterVolume = clamped)
 
         persistMasterVolumeJob?.cancel()
-        persistMasterVolumeJob = scope.launch(Dispatchers.IO) {
+        persistMasterVolumeJob = scope.launch(ioDispatcher) {
             delay(150L)
             preferences.setMasterVolume(clamped)
         }
@@ -343,7 +426,7 @@ class DriftPlaybackController(
         updateCachedPrefs(channelId, volume = clamped)
 
         persistVolumeJob?.cancel()
-        persistVolumeJob = scope.launch(Dispatchers.IO) {
+        persistVolumeJob = scope.launch(ioDispatcher) {
             delay(150L)
             preferences.setChannelVolume(channelId, clamped)
         }
@@ -361,7 +444,7 @@ class DriftPlaybackController(
         mixerEngine.updateChannelStates(updated)
         updateCachedPrefs(channelId, muted = newMuted)
 
-        scope.launch(Dispatchers.IO) {
+        scope.launch(ioDispatcher) {
             preferences.setChannelMuted(channelId, newMuted)
         }
     }
@@ -378,7 +461,7 @@ class DriftPlaybackController(
         mixerEngine.updateChannelStates(updated)
         updateCachedPrefs(channelId, playing = newPlaying)
 
-        scope.launch(Dispatchers.IO) {
+        scope.launch(ioDispatcher) {
             preferences.setChannelPlaying(channelId, newPlaying)
         }
 
@@ -405,7 +488,7 @@ class DriftPlaybackController(
             updateCachedPrefs(ch.spec.id, volume = ch.volume, muted = false, playing = true)
         }
 
-        scope.launch(Dispatchers.IO) {
+        scope.launch(ioDispatcher) {
             preferences.resetSceneDefaults(activeScene)
         }
     }
@@ -436,7 +519,7 @@ class DriftPlaybackController(
             channelPlaybackStates = emptyMap()
         )
 
-        scope.launch(Dispatchers.IO) {
+        scope.launch(ioDispatcher) {
             preferences.resetAllDefaults(SceneCatalog.scenes)
         }
     }
@@ -444,7 +527,7 @@ class DriftPlaybackController(
     fun setAutoPlayOnSceneSwitch(enabled: Boolean) {
         _uiState.update { it.copy(autoPlayOnSceneSwitch = enabled) }
         cachedPrefs = cachedPrefs?.copy(autoPlayOnSceneSwitch = enabled)
-        scope.launch(Dispatchers.IO) {
+        scope.launch(ioDispatcher) {
             preferences.setAutoPlayOnSceneSwitch(enabled)
         }
     }
@@ -452,7 +535,7 @@ class DriftPlaybackController(
     fun setSmoothCrossfadeEnabled(enabled: Boolean) {
         _uiState.update { it.copy(smoothCrossfadeEnabled = enabled) }
         cachedPrefs = cachedPrefs?.copy(smoothCrossfadeEnabled = enabled)
-        scope.launch(Dispatchers.IO) {
+        scope.launch(ioDispatcher) {
             preferences.setSmoothCrossfadeEnabled(enabled)
         }
     }
@@ -466,43 +549,78 @@ class DriftPlaybackController(
         preset: SleepTimerPreset? = null,
         fadeDurationSeconds: Float = SLEEP_FADE_DURATION_SECONDS
     ) {
+        val timerGen = ++sleepTimerGeneration
+        val safeTotalSeconds = totalSeconds.coerceAtLeast(1)
+        activeTimerFadeDurationSeconds = fadeDurationSeconds
         cancelSleepTimerInternal(clearFade = true)
+        timerRemainingMs = 0L
+        timerEndTimeMs = null
 
-        if (!_uiState.value.isPlayingOrFading) {
-            playAll()
+        val statusBeforeStart = _uiState.value.playbackStatus
+        if (statusBeforeStart == PlaybackStatus.FADING_OUT) {
+            _uiState.update {
+                it.copy(
+                    playbackStatus = PlaybackStatus.PLAYING,
+                    sleepTimer = SleepTimerState()
+                )
+            }
+        } else if (statusBeforeStart == PlaybackStatus.PAUSED || statusBeforeStart == PlaybackStatus.STOPPED) {
+            _uiState.update { it.copy(sleepTimer = SleepTimerState()) }
+            if (!playAllInternal()) {
+                notifyMediaSession()
+                return
+            }
         }
 
-        val endRealtimeMs = SystemClock.elapsedRealtime() + totalSeconds * 1000L
+        if (timerGen != sleepTimerGeneration || !_uiState.value.isPlayingOrFading) {
+            return
+        }
+
+        timerRemainingMs = safeTotalSeconds * 1000L
+        timerEndTimeMs = elapsedRealtimeMs() + timerRemainingMs
         _uiState.update {
             it.copy(
+                playbackStatus = PlaybackStatus.PLAYING,
                 sleepTimer = SleepTimerState(
                     isActive = true,
                     selectedPreset = preset,
-                    totalSeconds = totalSeconds,
-                    remainingSeconds = totalSeconds,
-                    isFadingOut = false
+                    totalSeconds = safeTotalSeconds,
+                    remainingSeconds = safeTotalSeconds,
+                    isFadingOut = false,
+                    isPaused = false
                 )
             )
         }
         notifyMediaSession()
 
+        launchSleepTimerLoop(timerGen, fadeDurationSeconds)
+    }
+
+    private fun launchSleepTimerLoop(timerGen: Long, fadeDurationSeconds: Float) {
+        sleepTimerJob?.cancel()
         sleepTimerJob = scope.launch {
-            while (isActive) {
-                val remainingMs = (endRealtimeMs - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+            while (isActive && timerGen == sleepTimerGeneration) {
+                val endMs = timerEndTimeMs ?: break
+                val remainingMs = (endMs - elapsedRealtimeMs()).coerceAtLeast(0L)
+                timerRemainingMs = remainingMs
                 val remainingSec = ((remainingMs + 999L) / 1000L).toInt()
 
                 _uiState.update {
-                    it.copy(
-                        sleepTimer = it.sleepTimer.copy(
-                            isActive = true,
-                            remainingSeconds = remainingSec
+                    if (!it.sleepTimer.isActive || it.sleepTimer.isPaused) {
+                        it
+                    } else {
+                        it.copy(
+                            sleepTimer = it.sleepTimer.copy(
+                                isActive = true,
+                                remainingSeconds = remainingSec
+                            )
                         )
-                    )
+                    }
                 }
                 notifyMediaSession()
 
                 if (remainingMs <= 0L) {
-                    triggerSleepTimerExpiryFade(fadeDurationSeconds)
+                    triggerSleepTimerExpiryFade(timerGen, fadeDurationSeconds)
                     break
                 }
                 delay(1000L)
@@ -511,23 +629,37 @@ class DriftPlaybackController(
     }
 
     fun cancelSleepTimer() {
-        val wasFading = _uiState.value.sleepTimer.isFadingOut
+        sleepTimerGeneration++
+        val wasFading = _uiState.value.sleepTimer.isFadingOut ||
+            _uiState.value.playbackStatus == PlaybackStatus.FADING_OUT
         cancelSleepTimerInternal(clearFade = true)
-        if (wasFading && _uiState.value.playbackStatus == PlaybackStatus.FADING_OUT) {
-            _uiState.update { it.copy(playbackStatus = PlaybackStatus.PLAYING) }
+        timerRemainingMs = 0L
+        timerEndTimeMs = null
+        _uiState.update {
+            it.copy(
+                playbackStatus = if (wasFading && it.playbackStatus == PlaybackStatus.FADING_OUT) {
+                    PlaybackStatus.PLAYING
+                } else {
+                    it.playbackStatus
+                },
+                sleepTimer = SleepTimerState()
+            )
         }
-        _uiState.update { it.copy(sleepTimer = SleepTimerState()) }
         notifyMediaSession()
     }
 
-    private fun triggerSleepTimerExpiryFade(fadeDurationSeconds: Float) {
+    private fun triggerSleepTimerExpiryFade(timerGen: Long, fadeDurationSeconds: Float) {
+        if (timerGen != sleepTimerGeneration) return
+        timerRemainingMs = 0L
+        timerEndTimeMs = null
         _uiState.update {
             it.copy(
                 playbackStatus = PlaybackStatus.FADING_OUT,
                 sleepTimer = it.sleepTimer.copy(
                     isActive = true,
                     remainingSeconds = 0,
-                    isFadingOut = true
+                    isFadingOut = true,
+                    isPaused = false
                 )
             )
         }
@@ -535,7 +667,9 @@ class DriftPlaybackController(
 
         mixerEngine.beginSleepFadeOut(durationSeconds = fadeDurationSeconds) {
             scope.launch {
-                stopAll()
+                if (timerGen == sleepTimerGeneration) {
+                    stopAll()
+                }
             }
         }
     }
@@ -557,9 +691,13 @@ class DriftPlaybackController(
     override fun onAudioFocusLost(transient: Boolean) {
         if (_uiState.value.isPlayingOrFading) {
             resumeOnAudioFocusGain = transient
+            if (!transient) {
+                mixerEngine.setDucking(false)
+            }
             pauseAll(fromAudioFocus = true)
         } else if (!transient) {
             resumeOnAudioFocusGain = false
+            mixerEngine.setDucking(false)
         }
     }
 

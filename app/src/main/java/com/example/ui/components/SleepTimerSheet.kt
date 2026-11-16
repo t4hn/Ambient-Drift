@@ -106,10 +106,11 @@ fun SleepTimerSheet(
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         Text(
-                            text = if (sleepTimer.isFadingOut) {
-                                stringResource(R.string.sleep_timer_fading)
-                            } else {
-                                formatDuration(sleepTimer.remainingSeconds)
+                            text = when {
+                                sleepTimer.isFadingOut -> stringResource(R.string.sleep_timer_fading)
+                                sleepTimer.isPaused ->
+                                    "${formatDuration(sleepTimer.remainingSeconds)} • ${stringResource(R.string.mixer_status_paused)}"
+                                else -> formatDuration(sleepTimer.remainingSeconds)
                             },
                             style = MaterialTheme.typography.displaySmall,
                             color = DriftEmerald,

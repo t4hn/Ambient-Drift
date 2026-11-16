@@ -317,6 +317,118 @@ class DriftAudioMixerEngineTest {
         assertTrue("Expected bounded write calls under zero-write backoff, got $totalCalls", totalCalls in 3..40)
     }
 
+    @Test
+    fun `pauseOrStopPlayback and startPlayback preserve all channel cursors`() {
+        val scene = SceneCatalog.scenes[0]
+        val engine = createTestEngine { _, _ -> constantStem(0.2f, frames = 50_000) }
+        val channels = scene.channels.map { ChannelState(it, 0.8f, isMuted = false, isPlaying = true) }
+
+        engine.loadScene(scene, channels, 1.0f, crossfade = false, isCurrentlyPlaying = false)
+        engine.startPlayback()
+
+        val buf = ShortArray(2048 * 2)
+        repeat(4) { engine.renderFrames(buf, 2048) }
+        val cursorsBeforePause = engine.getChannelCursors()
+        assertEquals(4, cursorsBeforePause.size)
+        cursorsBeforePause.values.forEach { cursor ->
+            assertTrue("Expected cursor > 0 after rendering, was $cursor", cursor >= 8192)
+        }
+
+        engine.pauseOrStopPlayback()
+        // Render through pause fade-out; cursors remain preserved (>= before pause)
+        repeat(15) { engine.renderFrames(buf, 2048) }
+        val cursorsWhilePaused = engine.getChannelCursors()
+        scene.channels.forEach { spec ->
+            assertTrue(
+                "Expected channel ${spec.id} cursor preserved across pause",
+                (cursorsWhilePaused[spec.id] ?: 0) >= (cursorsBeforePause[spec.id] ?: Int.MAX_VALUE)
+            )
+        }
+
+        engine.startPlayback()
+        val cursorsOnResume = engine.getChannelCursors()
+        assertEquals(cursorsWhilePaused, cursorsOnResume)
+        engine.renderFrames(buf, 2048)
+        val cursorsAfterResume = engine.getChannelCursors()
+        scene.channels.forEach { spec ->
+            assertTrue(
+                "Expected channel ${spec.id} to advance from preserved cursor",
+                (cursorsAfterResume[spec.id] ?: 0) > (cursorsOnResume[spec.id] ?: 0)
+            )
+        }
+        engine.release()
+    }
+
+    @Test
+    fun `ducking attenuates smoothly and restores cleanly without affecting volume settings`() {
+        val scene = SceneCatalog.scenes[0]
+        val engine = createTestEngine { _, _ -> constantStem(0.25f, frames = 4096) }
+        val channels = scene.channels.mapIndexed { idx, spec ->
+            ChannelState(spec, volume = if (idx == 0) 0.9f else 0f, isMuted = false, isPlaying = true)
+        }
+
+        engine.loadScene(scene, channels, 0.9f, crossfade = false, isCurrentlyPlaying = true)
+        engine.startPlayback()
+
+        val buf = ShortArray(2048 * 2)
+        repeat(15) { engine.renderFrames(buf, 2048) }
+        val normalRms = rms(buf)
+        assertTrue(normalRms > 4000.0)
+
+        engine.setDucking(true)
+        assertEquals(0.25f, engine.getDuckTarget(), 0.001f)
+        repeat(10) { engine.renderFrames(buf, 2048) }
+        val duckedRms = rms(buf)
+        assertEquals(normalRms * 0.25, duckedRms, normalRms * 0.05)
+
+        engine.setDucking(false)
+        assertEquals(1.0f, engine.getDuckTarget(), 0.001f)
+        repeat(10) { engine.renderFrames(buf, 2048) }
+        val restoredRms = rms(buf)
+        assertEquals(normalRms, restoredRms, normalRms * 0.05)
+        engine.release()
+    }
+
+    @Test
+    fun `cancelSleepFadeOut while running restores sleep fade gain smoothly without snapping`() {
+        val scene = SceneCatalog.scenes[0]
+        val engine = DriftAudioMixerEngine(
+            stemLoader = { _, _ -> constantStem(0.2f, frames = 512) },
+            sinkFactory = {
+                object : AudioOutputSink {
+                    override fun start() {}
+                    override fun write(pcm16Stereo: ShortArray, shortCount: Int): Int {
+                        Thread.sleep(5)
+                        return shortCount
+                    }
+                    override fun pauseAndFlush() {}
+                    override fun release() {}
+                }
+            }
+        )
+        val channels = scene.channels.map { ChannelState(it, 0.8f, isMuted = false, isPlaying = true) }
+        engine.loadScene(scene, channels, 1.0f, crossfade = false, isCurrentlyPlaying = true)
+        engine.startPlayback()
+        Thread.sleep(40)
+
+        var completed = false
+        engine.beginSleepFadeOut(durationSeconds = 0.5f) { completed = true }
+        val buf = ShortArray(2048 * 2)
+        repeat(4) { engine.renderFrames(buf, 2048) }
+        val midFadeGain = engine.getSleepFadeCurrent()
+        assertTrue("Expected fade-out to be partially faded, was $midFadeGain", midFadeGain in 0.1f..0.9f)
+
+        engine.cancelSleepFadeOut()
+        assertEquals(1.0f, engine.getSleepFadeTarget(), 0.001f)
+        // Smooth restoration means current gain does not snap instantaneously to 1.0f
+        assertTrue("Expected smooth recovery from $midFadeGain", engine.getSleepFadeCurrent() < 0.99f)
+
+        repeat(10) { engine.renderFrames(buf, 2048) }
+        assertEquals(1.0f, engine.getSleepFadeCurrent(), 0.001f)
+        assertFalse("Cancelled sleep fade-out must not fire completion callback", completed)
+        engine.release()
+    }
+
     private fun createTestEngine(stemLoader: StemLoader): DriftAudioMixerEngine {
         return DriftAudioMixerEngine(
             stemLoader = stemLoader,

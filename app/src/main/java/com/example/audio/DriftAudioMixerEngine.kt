@@ -172,6 +172,20 @@ class DriftAudioMixerEngine(
 
     internal fun isMixerThreadRunning(): Boolean = isThreadRunning.get()
 
+    internal fun hasLoadedScene(sceneId: String): Boolean = synchronized(lock) {
+        activeBus?.sceneId == sceneId
+    }
+
+    internal fun getChannelCursors(): Map<String, Int> = synchronized(lock) {
+        activeBus?.slots?.associate { it.spec.id to it.cursor }.orEmpty()
+    }
+
+    internal fun getDuckTarget(): Float = synchronized(lock) { duckTarget }
+
+    internal fun getSleepFadeTarget(): Float = synchronized(lock) { sleepFadeTarget }
+
+    internal fun getSleepFadeCurrent(): Float = synchronized(lock) { sleepFadeCurrent }
+
     fun loadScene(
         scene: SceneSpec,
         channelStates: List<ChannelState>,
@@ -265,8 +279,13 @@ class DriftAudioMixerEngine(
     fun startPlayback() {
         synchronized(lock) {
             onFadeOutCompleted = null
+            if (sleepFadeTarget < 1f) {
+                sleepFadeStep = MASTER_PAUSE_FADE_OUT_STEP
+            }
             sleepFadeTarget = 1f
-            sleepFadeCurrent = 1f
+            if (!isThreadRunning.get()) {
+                sleepFadeCurrent = 1f
+            }
             masterGateTarget = 1f
             masterGateStep = MASTER_PLAY_FADE_IN_STEP
             activeBus?.let { bus ->
@@ -306,8 +325,13 @@ class DriftAudioMixerEngine(
     fun cancelSleepFadeOut() {
         synchronized(lock) {
             onFadeOutCompleted = null
+            if (sleepFadeTarget < 1f) {
+                sleepFadeStep = MASTER_PAUSE_FADE_OUT_STEP
+            }
             sleepFadeTarget = 1f
-            sleepFadeCurrent = 1f
+            if (!isThreadRunning.get()) {
+                sleepFadeCurrent = 1f
+            }
         }
     }
 

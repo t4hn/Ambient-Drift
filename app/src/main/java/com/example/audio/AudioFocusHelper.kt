@@ -30,30 +30,50 @@ class AudioFocusHelper(
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private var focusRequest: AudioFocusRequest? = null
     private var hasFocus = false
+    private var isDucked = false
 
     private val afChangeListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
         when (focusChange) {
             AudioManager.AUDIOFOCUS_GAIN -> {
                 hasFocus = true
+                isDucked = false
                 listener.onAudioFocusDuck(false)
                 listener.onAudioFocusGained()
             }
             AudioManager.AUDIOFOCUS_LOSS -> {
                 hasFocus = false
+                if (isDucked) {
+                    isDucked = false
+                    listener.onAudioFocusDuck(false)
+                }
                 listener.onAudioFocusLost(transient = false)
             }
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
                 hasFocus = false
+                if (isDucked) {
+                    isDucked = false
+                    listener.onAudioFocusDuck(false)
+                }
                 listener.onAudioFocusLost(transient = true)
             }
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                isDucked = true
                 listener.onAudioFocusDuck(true)
             }
         }
     }
 
+    internal val focusChangeListener: AudioManager.OnAudioFocusChangeListener
+        get() = afChangeListener
+
     override fun requestFocus(): FocusRequestOutcome {
-        if (hasFocus) return FocusRequestOutcome.GRANTED
+        if (hasFocus) {
+            if (isDucked) {
+                isDucked = false
+                listener.onAudioFocusDuck(false)
+            }
+            return FocusRequestOutcome.GRANTED
+        }
 
         val result = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val attrs = AudioAttributes.Builder()
@@ -80,6 +100,10 @@ class AudioFocusHelper(
         return when (result) {
             AudioManager.AUDIOFOCUS_REQUEST_GRANTED -> {
                 hasFocus = true
+                if (isDucked) {
+                    isDucked = false
+                    listener.onAudioFocusDuck(false)
+                }
                 FocusRequestOutcome.GRANTED
             }
             AudioManager.AUDIOFOCUS_REQUEST_DELAYED -> {
@@ -102,5 +126,9 @@ class AudioFocusHelper(
             audioManager.abandonAudioFocus(afChangeListener)
         }
         hasFocus = false
+        if (isDucked) {
+            isDucked = false
+            listener.onAudioFocusDuck(false)
+        }
     }
 }
