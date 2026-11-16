@@ -1,0 +1,91 @@
+<resources>
+    <string name="app_name">DRIFT</string>
+
+    <!-- Navigation -->
+    <string name="nav_scenes">Scenes</string>
+    <string name="nav_mixer">Mixer</string>
+    <string name="nav_settings">Settings</string>
+
+    <!-- Scenes Screen -->
+    <string name="scenes_header_subtitle">AMBIENT SOUNDSCAPES</string>
+    <string name="scenes_channel_count">4 channels</string>
+    <string name="scenes_active_badge">ACTIVE</string>
+    <string name="scenes_playing_badge">PLAYING</string>
+
+    <!-- Scene 01: Storm -->
+    <string name="scene_storm_title">STORM</string>
+    <string name="scene_storm_subtitle">Substantial nighttime rain, distant and heavy thunder, and sweeping wind gusts.</string>
+    <string name="channel_storm_rainfall">Continuous rainfall</string>
+    <string name="channel_storm_distant_thunder">Distant thunder</string>
+    <string name="channel_storm_heavy_thunder">Heavy thunder</string>
+    <string name="channel_storm_wind_gusts">Wind gusts</string>
+
+    <!-- Scene 02: Deep Space -->
+    <string name="scene_space_title">DEEP SPACE</string>
+    <string name="scene_space_subtitle">Low-frequency spacecraft drones, reactor hum, and distant metallic resonance.</string>
+    <string name="channel_space_engine">Deep spacecraft engine drone</string>
+    <string name="channel_space_reactor">Low-frequency reactor hum</string>
+    <string name="channel_space_metallic">Distant metallic resonance</string>
+    <string name="channel_space_electronic">Subtle electronic ambience</string>
+
+    <!-- Scene 03: Abyss -->
+    <string name="scene_abyss_title">ABYSS</string>
+    <string name="scene_abyss_subtitle">Deep underwater rumble, slow ocean currents, and distant whale-like calls.</string>
+    <string name="channel_abyss_rumble">Deep underwater rumble</string>
+    <string name="channel_abyss_currents">Slow underwater currents</string>
+    <string name="channel_abyss_whales">Distant whale-like calls</string>
+    <string name="channel_abyss_drone">Deep resonant drone</string>
+
+    <!-- Mixer Controls -->
+    <string name="mixer_master_volume">Master Volume</string>
+    <string name="mixer_play_all">Play All</string>
+    <string name="mixer_pause_all">Pause All</string>
+    <string name="mixer_stop_all">Stop All</string>
+    <string name="mixer_reset_mix">Reset Mix</string>
+    <string name="mixer_status_playing">Playing</string>
+    <string name="mixer_status_paused">Paused</string>
+    <string name="mixer_status_stopped">Stopped</string>
+    <string name="mixer_status_fading_out">Fading out</string>
+    <string name="mixer_status_transitioning">Transitioning</string>
+    <string name="mixer_channel_muted">Muted</string>
+    <string name="mixer_channel_paused">Channel paused</string>
+    <string name="mixer_mute_cd">Toggle mute for %1$s</string>
+    <string name="mixer_channel_play_cd">Toggle playback for %1$s</string>
+    <string name="mixer_test_audio_badge">TEST AUDIO STEMS • OFFLINE</string>
+
+    <!-- Sleep Timer -->
+    <string name="sleep_timer_title">Sleep Timer</string>
+    <string name="sleep_timer_off">Off</string>
+    <string name="sleep_timer_cancel">Cancel Timer</string>
+    <string name="sleep_timer_15m">15m</string>
+    <string name="sleep_timer_30m">30m</string>
+    <string name="sleep_timer_60m">60m</string>
+    <string name="sleep_timer_90m">90m</string>
+    <string name="sleep_timer_remaining">%1$s remaining</string>
+    <string name="sleep_timer_fading">Fading out…</string>
+
+    <!-- Settings Screen -->
+    <string name="settings_title">Settings</string>
+    <string name="settings_playback_section">Playback &amp; Behavior</string>
+    <string name="settings_auto_resume_title">Auto-play on scene switch</string>
+    <string name="settings_auto_resume_desc">Automatically begin playing when selecting a new soundscape.</string>
+    <string name="settings_crossfade_title">Smooth scene crossfade</string>
+    <string name="settings_crossfade_desc">Gradually blend between scenes over 1.2 seconds when switching.</string>
+    <string name="settings_notifications_title">Background playback notifications</string>
+    <string name="settings_notifications_granted">Enabled for lock screen &amp; background controls</string>
+    <string name="settings_notifications_denied">Tap to allow lock screen media controls</string>
+    <string name="settings_audio_section">Audio Engine &amp; Assets</string>
+    <string name="settings_audio_source_title">Local Test Audio Sources</string>
+    <string name="settings_audio_source_desc">Release 0.1 uses offline synthesized test stems in res/raw/ for gapless 44.1 kHz multi-channel mixing. Mastered stems can replace them without engine changes.</string>
+    <string name="settings_reset_all_title">Reset all mixes to defaults</string>
+    <string name="settings_reset_all_desc">Restore default channel levels and master volume for all scenes.</string>
+    <string name="settings_about_section">About DRIFT</string>
+    <string name="settings_version_label">Release 0.1 • Local-First Offline Audio</string>
+
+    <!-- Notification -->
+    <string name="notification_channel_name">Ambient Playback</string>
+    <string name="notification_channel_desc">Persistent media controls for DRIFT ambient soundscapes</string>
+    <string name="notification_action_play">Play</string>
+    <string name="notification_action_pause">Pause</string>
+    <string name="notification_action_stop">Stop</string>
+</resources>
