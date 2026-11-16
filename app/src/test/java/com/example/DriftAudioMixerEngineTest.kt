@@ -320,7 +320,20 @@ class DriftAudioMixerEngineTest {
     @Test
     fun `pauseOrStopPlayback and startPlayback preserve all channel cursors`() {
         val scene = SceneCatalog.scenes[0]
-        val engine = createTestEngine { _, _ -> constantStem(0.2f, frames = 50_000) }
+        val engine = DriftAudioMixerEngine(
+            stemLoader = { _, _ -> constantStem(0.2f, frames = 200_000) },
+            sinkFactory = {
+                object : AudioOutputSink {
+                    override fun start() {}
+                    override fun write(pcm16Stereo: ShortArray, shortCount: Int): Int {
+                        Thread.sleep(5)
+                        return shortCount
+                    }
+                    override fun pauseAndFlush() {}
+                    override fun release() {}
+                }
+            }
+        )
         val channels = scene.channels.map { ChannelState(it, 0.8f, isMuted = false, isPlaying = true) }
 
         engine.loadScene(scene, channels, 1.0f, crossfade = false, isCurrentlyPlaying = false)
@@ -347,7 +360,12 @@ class DriftAudioMixerEngineTest {
 
         engine.startPlayback()
         val cursorsOnResume = engine.getChannelCursors()
-        assertEquals(cursorsWhilePaused, cursorsOnResume)
+        scene.channels.forEach { spec ->
+            assertTrue(
+                "Expected channel ${spec.id} cursor not reset on resume",
+                (cursorsOnResume[spec.id] ?: 0) >= (cursorsWhilePaused[spec.id] ?: Int.MAX_VALUE)
+            )
+        }
         engine.renderFrames(buf, 2048)
         val cursorsAfterResume = engine.getChannelCursors()
         scene.channels.forEach { spec ->

@@ -249,27 +249,17 @@ class DriftPlaybackController(
             }
         }
 
-        _uiState.update {
-            it.copy(
-                channels = updatedChannels,
-                playbackStatus = PlaybackStatus.PLAYING
-            )
-        }
-
-        if (updatedChannels !== state.channels) {
-            scope.launch(ioDispatcher) {
-                updatedChannels.forEach { ch -> preferences.setChannelPlaying(ch.spec.id, true) }
-            }
-        }
-
         // Resume any paused sleep timer alongside playback
         val activeTimer = _uiState.value.sleepTimer
+        var pendingExpiryTimerGen: Long? = null
         if (activeTimer.isActive && activeTimer.isPaused) {
             if (timerRemainingMs > 0L) {
                 val timerGen = ++sleepTimerGeneration
                 timerEndTimeMs = elapsedRealtimeMs() + timerRemainingMs
                 _uiState.update {
                     it.copy(
+                        channels = updatedChannels,
+                        playbackStatus = PlaybackStatus.PLAYING,
                         sleepTimer = it.sleepTimer.copy(
                             isPaused = false,
                             isFadingOut = false
@@ -279,12 +269,34 @@ class DriftPlaybackController(
                 launchSleepTimerLoop(timerGen, activeTimerFadeDurationSeconds)
             } else {
                 val timerGen = ++sleepTimerGeneration
+                pendingExpiryTimerGen = timerGen
+                timerRemainingMs = 0L
+                timerEndTimeMs = null
                 _uiState.update {
                     it.copy(
-                        sleepTimer = it.sleepTimer.copy(isPaused = false)
+                        channels = updatedChannels,
+                        playbackStatus = PlaybackStatus.FADING_OUT,
+                        sleepTimer = it.sleepTimer.copy(
+                            isActive = true,
+                            remainingSeconds = 0,
+                            isFadingOut = true,
+                            isPaused = false
+                        )
                     )
                 }
-                triggerSleepTimerExpiryFade(timerGen, activeTimerFadeDurationSeconds)
+            }
+        } else {
+            _uiState.update {
+                it.copy(
+                    channels = updatedChannels,
+                    playbackStatus = PlaybackStatus.PLAYING
+                )
+            }
+        }
+
+        if (updatedChannels !== state.channels) {
+            scope.launch(ioDispatcher) {
+                updatedChannels.forEach { ch -> preferences.setChannelPlaying(ch.spec.id, true) }
             }
         }
 
@@ -318,7 +330,11 @@ class DriftPlaybackController(
             }
             if (started) {
                 if (startMediaServiceIfNeeded()) {
-                    notifyMediaSession()
+                    if (pendingExpiryTimerGen != null && pendingExpiryTimerGen == sleepTimerGeneration) {
+                        triggerSleepTimerExpiryFade(pendingExpiryTimerGen, activeTimerFadeDurationSeconds)
+                    } else {
+                        notifyMediaSession()
+                    }
                 } else {
                     stopAll()
                 }

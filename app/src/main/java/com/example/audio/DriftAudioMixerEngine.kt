@@ -504,7 +504,8 @@ class DriftAudioMixerEngine(
                         var shouldBreak = false
                         synchronized(threadLifecycleLock) {
                             synchronized(lock) {
-                                val wantsResume = masterGateTarget > 0f && sleepFadeTarget > 0f
+                                val wantsResume = masterGateTarget > 0f &&
+                                    (sleepFadeTarget > 0f || sleepFadeCurrent > 0.0001f || onFadeOutCompleted != null)
                                 if (!wantsResume) {
                                     isThreadRunning.set(false)
                                     currentSink.pauseAndFlush()

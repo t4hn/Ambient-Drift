@@ -23,6 +23,7 @@ import com.example.service.DriftPlaybackController
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
@@ -37,6 +38,9 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -526,6 +530,196 @@ class DriftPhase2a1RegressionTest {
         advanceTimeBy(20_000L)
         runCurrent()
         assertEquals(PlaybackStatus.FADING_OUT, controller.uiState.value.playbackStatus)
+
+        controller.release()
+    }
+
+    @Test
+    fun `pausing during FADING_OUT and resuming before render thread stops completes fade and stops once`() = runTest {
+        val writeEntered = CountDownLatch(1)
+        val allowWritesToProceed = CountDownLatch(1)
+        val releaseSink = AtomicBoolean(false)
+
+        val engine = DriftAudioMixerEngine(
+            stemLoader = { _, _ ->
+                AudioStem(FloatArray(44_100) { 0.2f }, FloatArray(44_100) { 0.2f }, DriftAudioMixerEngine.SAMPLE_RATE)
+            },
+            sinkFactory = {
+                object : AudioOutputSink {
+                    override fun start() {}
+                    override fun write(pcm16Stereo: ShortArray, shortCount: Int): Int {
+                        writeEntered.countDown()
+                        // Hold the background render thread alive deterministically until released
+                        if (!releaseSink.get()) {
+                            allowWritesToProceed.await(5, TimeUnit.SECONDS)
+                        }
+                        return shortCount
+                    }
+                    override fun pauseAndFlush() {}
+                    override fun release() {
+                        releaseSink.set(true)
+                        allowWritesToProceed.countDown()
+                    }
+                }
+            }
+        )
+        val controller = createController(engine)
+        val statusTransitions = mutableListOf<PlaybackStatus>()
+        val collectJob = backgroundScope.launch(StandardTestDispatcher(testScheduler)) {
+            controller.uiState.collect { state ->
+                if (statusTransitions.lastOrNull() != state.playbackStatus) {
+                    statusTransitions.add(state.playbackStatus)
+                }
+            }
+        }
+        runCurrent()
+
+        controller.startSleepTimerSeconds(totalSeconds = 3, preset = SleepTimerPreset.FIFTEEN, fadeDurationSeconds = 0.5f)
+        runCurrent()
+        assertTrue(writeEntered.await(2, TimeUnit.SECONDS))
+        assertTrue(engine.isMixerThreadRunning())
+
+        // Reach FADING_OUT
+        advanceTimeBy(3_000L)
+        runCurrent()
+        assertEquals(PlaybackStatus.FADING_OUT, controller.uiState.value.playbackStatus)
+        assertTrue(controller.uiState.value.sleepTimer.isFadingOut)
+        assertEquals(0.0f, engine.getSleepFadeTarget(), 0.001f)
+
+        // Advance fade partially
+        val pcm = ShortArray(2048 * 2)
+        repeat(4) { engine.renderFrames(pcm, 2048) }
+        assertTrue(engine.getSleepFadeCurrent() in 0.1f..0.95f)
+
+        // Pause during FADING_OUT while render thread is still running
+        controller.pauseAll()
+        runCurrent()
+        assertEquals(PlaybackStatus.PAUSED, controller.uiState.value.playbackStatus)
+        assertTrue(controller.uiState.value.sleepTimer.isActive)
+        assertTrue(controller.uiState.value.sleepTimer.isPaused)
+        assertFalse(controller.uiState.value.sleepTimer.isFadingOut)
+        assertEquals(0, controller.uiState.value.sleepTimer.remainingSeconds)
+        assertTrue("Render thread must still be running before resume", engine.isMixerThreadRunning())
+
+        // Resume BEFORE the master pause fade completes / render thread stops
+        controller.playAll()
+        runCurrent()
+
+        assertEquals(PlaybackStatus.FADING_OUT, controller.uiState.value.playbackStatus)
+        assertTrue(controller.uiState.value.sleepTimer.isActive)
+        assertFalse(controller.uiState.value.sleepTimer.isPaused)
+        assertTrue(controller.uiState.value.sleepTimer.isFadingOut)
+        assertEquals(
+            "startPlayback() must not cancel newly resumed expiry fade",
+            0.0f,
+            engine.getSleepFadeTarget(),
+            0.001f
+        )
+
+        // Drive fade-out to completion -> stops exactly once
+        var guard = 0
+        while (controller.uiState.value.playbackStatus != PlaybackStatus.STOPPED && guard < 100) {
+            engine.renderFrames(pcm, 2048)
+            runCurrent()
+            guard++
+        }
+        assertEquals(PlaybackStatus.STOPPED, controller.uiState.value.playbackStatus)
+        assertEquals(SleepTimerState(), controller.uiState.value.sleepTimer)
+
+        // Let the blocked render thread unblock and finish cleanly
+        releaseSink.set(true)
+        allowWritesToProceed.countDown()
+        var stopWait = 0
+        while (engine.isMixerThreadRunning() && stopWait < 100) {
+            Thread.sleep(5)
+            stopWait++
+        }
+        runCurrent()
+        assertFalse(engine.isMixerThreadRunning())
+        assertEquals(
+            listOf(
+                PlaybackStatus.STOPPED,
+                PlaybackStatus.PLAYING,
+                PlaybackStatus.FADING_OUT,
+                PlaybackStatus.PAUSED,
+                PlaybackStatus.FADING_OUT,
+                PlaybackStatus.STOPPED
+            ),
+            statusTransitions
+        )
+
+        collectJob.cancel()
+        controller.release()
+    }
+
+    @Test
+    fun `resuming expired paused timer after render thread stops and cancelling resumed fade behave cleanly`() = runTest {
+        val engine = DriftAudioMixerEngine(
+            stemLoader = { _, _ ->
+                AudioStem(FloatArray(44_100) { 0.2f }, FloatArray(44_100) { 0.2f }, DriftAudioMixerEngine.SAMPLE_RATE)
+            },
+            sinkFactory = {
+                object : AudioOutputSink {
+                    override fun start() {}
+                    override fun write(pcm16Stereo: ShortArray, shortCount: Int): Int = shortCount
+                    override fun pauseAndFlush() {}
+                    override fun release() {}
+                }
+            }
+        )
+        val controller = createController(engine)
+        runCurrent()
+
+        // Case 1: Pause during FADING_OUT, wait for render thread to stop completely, then resume -> fades & stops
+        controller.startSleepTimerSeconds(totalSeconds = 2, preset = SleepTimerPreset.FIFTEEN, fadeDurationSeconds = 0.5f)
+        runCurrent()
+        advanceTimeBy(2_000L)
+        runCurrent()
+        assertEquals(PlaybackStatus.FADING_OUT, controller.uiState.value.playbackStatus)
+
+        controller.pauseAll()
+        runCurrent()
+        assertEquals(PlaybackStatus.PAUSED, controller.uiState.value.playbackStatus)
+
+        var stopWait = 0
+        while (engine.isMixerThreadRunning() && stopWait < 200) {
+            Thread.sleep(5)
+            stopWait++
+        }
+        assertFalse("Render thread should finish pause fade and stop", engine.isMixerThreadRunning())
+
+        // Resume after render thread stopped: must start thread, enter FADING_OUT, fade down, and stop
+        controller.playAll()
+        runCurrent()
+        assertEquals(PlaybackStatus.FADING_OUT, controller.uiState.value.playbackStatus)
+        assertTrue(controller.uiState.value.sleepTimer.isFadingOut)
+        assertEquals(0.0f, engine.getSleepFadeTarget(), 0.001f)
+        assertTrue(engine.isMixerThreadRunning())
+
+        var fadeWait = 0
+        while (controller.uiState.value.playbackStatus != PlaybackStatus.STOPPED && fadeWait < 200) {
+            Thread.sleep(10)
+            runCurrent()
+            fadeWait++
+        }
+        assertEquals(PlaybackStatus.STOPPED, controller.uiState.value.playbackStatus)
+        assertEquals(SleepTimerState(), controller.uiState.value.sleepTimer)
+
+        // Case 2: Cancel timer immediately after resuming from paused FADING_OUT before async startup runs
+        controller.startSleepTimerSeconds(totalSeconds = 2, preset = SleepTimerPreset.FIFTEEN, fadeDurationSeconds = 0.5f)
+        runCurrent()
+        advanceTimeBy(2_000L)
+        runCurrent()
+        controller.pauseAll()
+        runCurrent()
+
+        controller.playAll()
+        controller.cancelSleepTimer()
+        runCurrent()
+
+        assertEquals(PlaybackStatus.PLAYING, controller.uiState.value.playbackStatus)
+        assertEquals(SleepTimerState(), controller.uiState.value.sleepTimer)
+        assertEquals(1.0f, engine.getSleepFadeTarget(), 0.001f)
 
         controller.release()
     }
