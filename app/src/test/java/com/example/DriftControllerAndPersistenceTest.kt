@@ -1,6 +1,7 @@
 package com.example
 
 import android.content.Context
+import android.media.AudioTrack
 import android.os.Looper
 import androidx.test.core.app.ApplicationProvider
 import com.example.audio.AudioFocusClient
@@ -27,6 +28,7 @@ import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 
 import java.time.Duration
+import java.util.concurrent.atomic.AtomicBoolean
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [36])
@@ -294,6 +296,94 @@ class DriftControllerAndPersistenceTest {
 
         assertEquals(SceneCatalog.SCENE_ABYSS_ID, controller.uiState.value.activeScene?.id)
         assertFalse("Expected isTransitioning to return to false", controller.uiState.value.isTransitioning)
+        controller.release()
+    }
+
+    @Test
+    fun `controller moves playback state to STOPPED when sink write fails fatally`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val repo = DriftPreferencesRepository(context)
+        val failNextWrite = AtomicBoolean(false)
+        val engine = DriftAudioMixerEngine(
+            stemLoader = StemLoader { _, _ ->
+                AudioStem(FloatArray(512) { 0.1f }, FloatArray(512) { 0.1f }, DriftAudioMixerEngine.SAMPLE_RATE)
+            },
+            sinkFactory = {
+                object : AudioOutputSink {
+                    override fun start() {}
+                    override fun write(pcm16Stereo: ShortArray, shortCount: Int): Int {
+                        return if (failNextWrite.get()) {
+                            AudioTrack.ERROR_INVALID_OPERATION
+                        } else {
+                            Thread.sleep(5)
+                            shortCount
+                        }
+                    }
+                    override fun pauseAndFlush() {}
+                    override fun release() {}
+                }
+            }
+        )
+
+        val controller = DriftPlaybackController(
+            appContext = context,
+            preferences = repo,
+            mixerEngine = engine,
+            enableAndroidServiceBridge = false
+        )
+        awaitUntil { controller.uiState.value.activeScene != null }
+
+        controller.playAll()
+        awaitUntil { controller.uiState.value.playbackStatus == PlaybackStatus.PLAYING }
+
+        failNextWrite.set(true)
+        awaitUntil { controller.uiState.value.playbackStatus == PlaybackStatus.STOPPED }
+        assertEquals(PlaybackStatus.STOPPED, controller.uiState.value.playbackStatus)
+        controller.release()
+    }
+
+    @Test
+    fun `foreground service start failure does not crash and resets UI state to STOPPED`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val repo = DriftPreferencesRepository(context)
+        val noopEngine = DriftAudioMixerEngine(
+            stemLoader = StemLoader { _, _ ->
+                AudioStem(FloatArray(512) { 0.1f }, FloatArray(512) { 0.1f }, DriftAudioMixerEngine.SAMPLE_RATE)
+            },
+            sinkFactory = {
+                object : AudioOutputSink {
+                    override fun start() {}
+                    override fun write(pcm16Stereo: ShortArray, shortCount: Int): Int {
+                        Thread.sleep(5)
+                        return shortCount
+                    }
+                    override fun pauseAndFlush() {}
+                    override fun release() {}
+                }
+            }
+        )
+
+        val controller = DriftPlaybackController(
+            appContext = context,
+            preferences = repo,
+            mixerEngine = noopEngine,
+            enableAndroidServiceBridge = true
+        ).apply {
+            serviceStarter = {
+                throw IllegalStateException("Simulated ForegroundServiceStartNotAllowedException")
+            }
+        }
+        awaitUntil { controller.uiState.value.activeScene != null }
+
+        controller.playAll()
+        awaitUntil {
+            // Wait for playAll coroutine + service failure stopAll to settle back to STOPPED
+            !noopEngine.isMixerThreadRunning() && controller.uiState.value.playbackStatus == PlaybackStatus.STOPPED
+        }
+        delay(100)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertEquals(PlaybackStatus.STOPPED, controller.uiState.value.playbackStatus)
         controller.release()
     }
 }

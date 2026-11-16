@@ -3,6 +3,7 @@ package com.example.service
 import android.content.Context
 import android.content.Intent
 import android.os.SystemClock
+import android.util.Log
 import androidx.core.content.ContextCompat
 import com.example.audio.AudioFocusClient
 import com.example.audio.AudioFocusHelper
@@ -43,6 +44,7 @@ class DriftPlaybackController(
 ) : AudioFocusListener {
 
     companion object {
+        private const val TAG = "DriftPlaybackController"
         const val SLEEP_FADE_DURATION_SECONDS = 8.0f
     }
 
@@ -82,7 +84,16 @@ class DriftPlaybackController(
     )
     val uiState: StateFlow<DriftPlaybackUiState> = _uiState.asStateFlow()
 
+    internal var serviceStarter: (Intent) -> Unit = { intent ->
+        ContextCompat.startForegroundService(appContext, intent)
+    }
+
     init {
+        mixerEngine.setOnPlaybackErrorListener {
+            scope.launch {
+                stopAll()
+            }
+        }
         scope.launch {
             val loaded = withContext(Dispatchers.IO) {
                 preferences.readInitialPreferences()
@@ -261,8 +272,11 @@ class DriftPlaybackController(
                 started = true
             }
             if (started) {
-                startMediaServiceIfNeeded()
-                notifyMediaSession()
+                if (startMediaServiceIfNeeded()) {
+                    notifyMediaSession()
+                } else {
+                    stopAll()
+                }
             }
         }
     }
@@ -572,11 +586,15 @@ class DriftPlaybackController(
         mixerEngine.release()
     }
 
-    private fun startMediaServiceIfNeeded() {
-        if (!enableAndroidServiceBridge) return
-        runCatching {
+    private fun startMediaServiceIfNeeded(): Boolean {
+        if (!enableAndroidServiceBridge) return true
+        return try {
             val intent = Intent(appContext, DriftPlaybackService::class.java)
-            ContextCompat.startForegroundService(appContext, intent)
+            serviceStarter(intent)
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "Unable to start foreground playback service", e)
+            false
         }
     }
 

@@ -4,6 +4,7 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
 import android.os.Process
+import android.util.Log
 import com.example.model.AudioChannelSpec
 import com.example.model.ChannelState
 import com.example.model.SceneSpec
@@ -109,6 +110,10 @@ class DriftAudioMixerEngine(
         private const val MASTER_PAUSE_FADE_OUT_STEP = 1f / (SAMPLE_RATE * 0.30f) // 300ms pause/stop fade
         private const val CROSSFADE_STEP = 1f / (SAMPLE_RATE * 1.20f) // 1.2s scene transition
         private const val DUCK_STEP = 1f / (SAMPLE_RATE * 0.25f) // 250ms duck transition
+        private const val MAX_DEAD_OBJECT_RETRIES = 3
+        private const val DEAD_OBJECT_RETRY_WINDOW_NS = 5_000_000_000L
+        private const val ZERO_WRITE_SPIN_THRESHOLD = 3
+        private const val ZERO_WRITE_SLEEP_MS = 10L
     }
 
     private class ChannelSlot(
@@ -157,6 +162,15 @@ class DriftAudioMixerEngine(
 
     @Volatile
     private var onFadeOutCompleted: (() -> Unit)? = null
+
+    @Volatile
+    private var onPlaybackError: (() -> Unit)? = null
+
+    fun setOnPlaybackErrorListener(listener: (() -> Unit)?) {
+        onPlaybackError = listener
+    }
+
+    internal fun isMixerThreadRunning(): Boolean = isThreadRunning.get()
 
     fun loadScene(
         scene: SceneSpec,
@@ -409,9 +423,59 @@ class DriftAudioMixerEngine(
             val thread = Thread({
                 runCatching { Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO) }
                 val pcmBuffer = ShortArray(FRAMES_PER_BUFFER * 2)
+                var currentSink = activeSink
+                val deadObjectRetryTimesNs = ArrayDeque<Long>()
+                var consecutiveZeroWrites = 0
+
                 while (isThreadRunning.get()) {
                     val keepGoing = renderFrames(pcmBuffer, FRAMES_PER_BUFFER)
-                    activeSink.write(pcmBuffer, pcmBuffer.size)
+                    val written = currentSink.write(pcmBuffer, pcmBuffer.size)
+
+                    if (written < 0) {
+                        consecutiveZeroWrites = 0
+                        if (!isThreadRunning.get()) break
+
+                        if (written == AudioTrack.ERROR_DEAD_OBJECT) {
+                            val nowNs = System.nanoTime()
+                            while (deadObjectRetryTimesNs.isNotEmpty() &&
+                                nowNs - deadObjectRetryTimesNs.first() > DEAD_OBJECT_RETRY_WINDOW_NS
+                            ) {
+                                deadObjectRetryTimesNs.removeFirst()
+                            }
+                            if (deadObjectRetryTimesNs.size < MAX_DEAD_OBJECT_RETRIES) {
+                                deadObjectRetryTimesNs.addLast(nowNs)
+                                runCatching {
+                                    Log.w(
+                                        "DriftAudioMixerEngine",
+                                        "Audio sink returned ERROR_DEAD_OBJECT; recreating sink (${deadObjectRetryTimesNs.size}/$MAX_DEAD_OBJECT_RETRIES)"
+                                    )
+                                }
+                                val replacement = recreateSinkLocked(currentSink)
+                                if (replacement != null) {
+                                    currentSink = replacement
+                                    runCatching { Thread.sleep(20L) }
+                                    continue
+                                }
+                            }
+                        }
+
+                        runCatching {
+                            Log.e("DriftAudioMixerEngine", "Audio sink write failed ($written); stopping mixer")
+                        }
+                        val stoppedByError = stopAfterWriteFailure(currentSink)
+                        if (stoppedByError) {
+                            onPlaybackError?.invoke()
+                        }
+                        break
+                    } else if (written == 0) {
+                        consecutiveZeroWrites++
+                        if (consecutiveZeroWrites >= ZERO_WRITE_SPIN_THRESHOLD) {
+                            runCatching { Thread.sleep(ZERO_WRITE_SLEEP_MS) }
+                        }
+                    } else {
+                        consecutiveZeroWrites = 0
+                    }
+
                     if (!keepGoing) {
                         var shouldBreak = false
                         synchronized(threadLifecycleLock) {
@@ -419,7 +483,7 @@ class DriftAudioMixerEngine(
                                 val wantsResume = masterGateTarget > 0f && sleepFadeTarget > 0f
                                 if (!wantsResume) {
                                     isThreadRunning.set(false)
-                                    activeSink.pauseAndFlush()
+                                    currentSink.pauseAndFlush()
                                     shouldBreak = true
                                 }
                             }
@@ -430,6 +494,41 @@ class DriftAudioMixerEngine(
             }, "DriftAudioMixerThread")
             renderThread = thread
             thread.start()
+        }
+    }
+
+    private fun recreateSinkLocked(failedSink: AudioOutputSink): AudioOutputSink? {
+        return synchronized(threadLifecycleLock) {
+            if (!isThreadRunning.get()) return@synchronized null
+            runCatching { failedSink.release() }
+            if (sink === failedSink) {
+                sink = null
+            }
+            runCatching {
+                sinkFactory().also { fresh ->
+                    fresh.start()
+                    sink = fresh
+                }
+            }.getOrNull()
+        }
+    }
+
+    private fun stopAfterWriteFailure(failedSink: AudioOutputSink): Boolean {
+        return synchronized(threadLifecycleLock) {
+            val wasRunning = isThreadRunning.getAndSet(false)
+            if (renderThread === Thread.currentThread()) {
+                renderThread = null
+            }
+            synchronized(lock) {
+                masterGateTarget = 0f
+                masterGateCurrent = 0f
+                onFadeOutCompleted = null
+            }
+            runCatching { failedSink.release() }
+            if (sink === failedSink) {
+                sink = null
+            }
+            wasRunning
         }
     }
 

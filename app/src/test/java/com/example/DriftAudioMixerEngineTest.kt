@@ -1,13 +1,19 @@
 package com.example
 
+import android.media.AudioTrack
+import com.example.audio.AudioOutputSink
 import com.example.audio.AudioStem
 import com.example.audio.DriftAudioMixerEngine
 import com.example.audio.StemLoader
 import com.example.model.ChannelState
 import com.example.model.SceneCatalog
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.sin
@@ -196,6 +202,119 @@ class DriftAudioMixerEngineTest {
             prev = curr
         }
         engine.release()
+    }
+
+    @Test
+    fun `dead object write error recreates sink once and recovers without stopping playback`() {
+        val scene = SceneCatalog.scenes[0]
+        val channels = scene.channels.map { ChannelState(it, 0.5f, isMuted = false, isPlaying = true) }
+        val sinkCount = AtomicInteger(0)
+        val releaseCount = AtomicInteger(0)
+        val healthyWrites = CountDownLatch(3)
+        val errorTriggered = AtomicInteger(0)
+
+        val engine = DriftAudioMixerEngine(
+            stemLoader = { _, _ -> constantStem(0.1f, frames = 512) },
+            sinkFactory = {
+                val id = sinkCount.incrementAndGet()
+                val writesOnThisSink = AtomicInteger(0)
+                object : AudioOutputSink {
+                    override fun start() {}
+                    override fun write(pcm16Stereo: ShortArray, shortCount: Int): Int {
+                        val n = writesOnThisSink.incrementAndGet()
+                        if (id == 1 && n == 1) {
+                            return AudioTrack.ERROR_DEAD_OBJECT
+                        }
+                        healthyWrites.countDown()
+                        Thread.sleep(5)
+                        return shortCount
+                    }
+                    override fun pauseAndFlush() {}
+                    override fun release() {
+                        releaseCount.incrementAndGet()
+                    }
+                }
+            }
+        )
+        engine.setOnPlaybackErrorListener { errorTriggered.incrementAndGet() }
+        engine.loadScene(scene, channels, 1.0f, crossfade = false, isCurrentlyPlaying = false)
+        engine.startPlayback()
+
+        assertTrue("Expected recovered sink to continue writing", healthyWrites.await(2, TimeUnit.SECONDS))
+        assertEquals(2, sinkCount.get())
+        assertEquals(1, releaseCount.get())
+        assertEquals(0, errorTriggered.get())
+        assertTrue(engine.isMixerThreadRunning())
+        engine.release()
+    }
+
+    @Test
+    fun `persistent negative write errors stop render thread cleanly without spinning and notify listener`() {
+        val scene = SceneCatalog.scenes[0]
+        val channels = scene.channels.map { ChannelState(it, 0.5f, isMuted = false, isPlaying = true) }
+        val sinkCreated = AtomicInteger(0)
+        val writeCalls = AtomicInteger(0)
+        val errorLatch = CountDownLatch(1)
+
+        val engine = DriftAudioMixerEngine(
+            stemLoader = { _, _ -> constantStem(0.1f, frames = 512) },
+            sinkFactory = {
+                sinkCreated.incrementAndGet()
+                object : AudioOutputSink {
+                    override fun start() {}
+                    override fun write(pcm16Stereo: ShortArray, shortCount: Int): Int {
+                        writeCalls.incrementAndGet()
+                        return AudioTrack.ERROR_DEAD_OBJECT
+                    }
+                    override fun pauseAndFlush() {}
+                    override fun release() {}
+                }
+            }
+        )
+        engine.setOnPlaybackErrorListener { errorLatch.countDown() }
+        engine.loadScene(scene, channels, 1.0f, crossfade = false, isCurrentlyPlaying = false)
+        engine.startPlayback()
+
+        assertTrue("Expected playback error listener to fire", errorLatch.await(2, TimeUnit.SECONDS))
+        Thread.sleep(50)
+        val callsAfterStop = writeCalls.get()
+        Thread.sleep(50)
+        assertEquals("Render thread must stop cleanly instead of spinning", callsAfterStop, writeCalls.get())
+        assertFalse(engine.isMixerThreadRunning())
+        // Initial sink + 3 bounded retries = 4 total sinks created
+        assertEquals(4, sinkCreated.get())
+        engine.release()
+    }
+
+    @Test
+    fun `repeated zero writes sleep briefly instead of busy spinning`() {
+        val scene = SceneCatalog.scenes[0]
+        val channels = scene.channels.map { ChannelState(it, 0.5f, isMuted = false, isPlaying = true) }
+        val writeCalls = AtomicInteger(0)
+
+        val engine = DriftAudioMixerEngine(
+            stemLoader = { _, _ -> constantStem(0.1f, frames = 512) },
+            sinkFactory = {
+                object : AudioOutputSink {
+                    override fun start() {}
+                    override fun write(pcm16Stereo: ShortArray, shortCount: Int): Int {
+                        writeCalls.incrementAndGet()
+                        return 0
+                    }
+                    override fun pauseAndFlush() {}
+                    override fun release() {}
+                }
+            }
+        )
+        engine.loadScene(scene, channels, 1.0f, crossfade = false, isCurrentlyPlaying = false)
+        engine.startPlayback()
+
+        Thread.sleep(100)
+        val totalCalls = writeCalls.get()
+        engine.release()
+
+        // Without sleep backoff, 100ms in tight loop yields tens of thousands of calls.
+        assertTrue("Expected bounded write calls under zero-write backoff, got $totalCalls", totalCalls in 3..40)
     }
 
     private fun createTestEngine(stemLoader: StemLoader): DriftAudioMixerEngine {
