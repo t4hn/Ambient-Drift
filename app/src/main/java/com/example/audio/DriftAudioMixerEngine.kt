@@ -21,6 +21,7 @@ interface AudioOutputSink {
     fun write(pcm16Stereo: ShortArray, shortCount: Int): Int
     fun pauseAndFlush()
     fun release()
+    fun setLowPowerMode(enabled: Boolean) {}
 }
 
 class AndroidAudioTrackSink(
@@ -28,10 +29,22 @@ class AndroidAudioTrackSink(
 ) : AudioOutputSink {
 
     private var audioTrack: AudioTrack? = null
+    private var lowPowerMode: Boolean = false
+    private var standardBufferFrames: Int = 0
+    private var lowPowerBufferFrames: Int = 0
+
+    @Synchronized
+    override fun setLowPowerMode(enabled: Boolean) {
+        if (lowPowerMode == enabled) return
+        lowPowerMode = enabled
+        val track = audioTrack ?: return
+        applyBufferSize(track, enabled)
+    }
 
     @Synchronized
     override fun start() {
         val track = audioTrack ?: createTrack().also { audioTrack = it }
+        applyBufferSize(track, lowPowerMode)
         if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
             track.play()
         }
@@ -74,7 +87,12 @@ class AndroidAudioTrackSink(
             AudioFormat.ENCODING_PCM_16BIT
         ).coerceAtLeast(sampleRate / 10 * 4)
 
-        val bufferSizeBytes = (minBufBytes * 2).coerceAtLeast(16384)
+        val standardBytes = (minBufBytes * 2).coerceAtLeast(16384)
+        val lowPowerBytes = (minBufBytes * 6).coerceAtLeast(
+            DriftAudioMixerEngine.FRAMES_PER_BUFFER_LOW_POWER * 4 * 4
+        )
+        standardBufferFrames = standardBytes / 4
+        lowPowerBufferFrames = lowPowerBytes / 4
 
         val attrs = AudioAttributes.Builder()
             .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -90,9 +108,23 @@ class AndroidAudioTrackSink(
         return AudioTrack.Builder()
             .setAudioAttributes(attrs)
             .setAudioFormat(format)
-            .setBufferSizeInBytes(bufferSizeBytes)
+            .setBufferSizeInBytes(lowPowerBytes)
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
+    }
+
+    private fun applyBufferSize(track: AudioTrack, lowPower: Boolean) {
+        runCatching {
+            val capacity = track.bufferCapacityInFrames
+            if (capacity > 0) {
+                val targetFrames = if (lowPower) {
+                    lowPowerBufferFrames.coerceAtMost(capacity)
+                } else {
+                    standardBufferFrames.coerceIn(1, capacity)
+                }
+                track.setBufferSizeInFrames(targetFrames)
+            }
+        }
     }
 }
 
@@ -103,6 +135,7 @@ class DriftAudioMixerEngine(
     companion object {
         const val SAMPLE_RATE = 44100
         const val FRAMES_PER_BUFFER = 1024
+        const val FRAMES_PER_BUFFER_LOW_POWER = 4096
 
         // Per-sample smoothing rates (zero-click transitions)
         private const val CHANNEL_GAIN_STEP = 1f / (SAMPLE_RATE * 0.045f) // ~45ms click-free channel ramp
@@ -114,6 +147,7 @@ class DriftAudioMixerEngine(
         private const val DEAD_OBJECT_RETRY_WINDOW_NS = 5_000_000_000L
         private const val ZERO_WRITE_SPIN_THRESHOLD = 3
         private const val ZERO_WRITE_SLEEP_MS = 10L
+        private const val ZERO_WRITE_SLEEP_LOW_POWER_MS = 30L
     }
 
     private class ChannelSlot(
@@ -161,6 +195,9 @@ class DriftAudioMixerEngine(
     private var sink: AudioOutputSink? = null
 
     @Volatile
+    private var lowPowerMode: Boolean = false
+
+    @Volatile
     private var onFadeOutCompleted: (() -> Unit)? = null
 
     @Volatile
@@ -168,6 +205,19 @@ class DriftAudioMixerEngine(
 
     fun setOnPlaybackErrorListener(listener: (() -> Unit)?) {
         onPlaybackError = listener
+    }
+
+    fun setLowPowerMode(enabled: Boolean) {
+        lowPowerMode = enabled
+        synchronized(threadLifecycleLock) {
+            sink?.setLowPowerMode(enabled)
+        }
+    }
+
+    internal fun isLowPowerMode(): Boolean = lowPowerMode
+
+    internal fun getFramesPerBuffer(): Int {
+        return if (lowPowerMode) FRAMES_PER_BUFFER_LOW_POWER else FRAMES_PER_BUFFER
     }
 
     internal fun isMixerThreadRunning(): Boolean = isThreadRunning.get()
@@ -443,17 +493,25 @@ class DriftAudioMixerEngine(
             if (isThreadRunning.get()) return
             isThreadRunning.set(true)
             val activeSink = sink ?: sinkFactory().also { sink = it }
+            activeSink.setLowPowerMode(lowPowerMode)
             activeSink.start()
             val thread = Thread({
                 runCatching { Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO) }
-                val pcmBuffer = ShortArray(FRAMES_PER_BUFFER * 2)
+                val pcmBuffer = ShortArray(FRAMES_PER_BUFFER_LOW_POWER * 2)
                 var currentSink = activeSink
                 val deadObjectRetryTimesNs = ArrayDeque<Long>()
                 var consecutiveZeroWrites = 0
 
                 while (isThreadRunning.get()) {
-                    val keepGoing = renderFrames(pcmBuffer, FRAMES_PER_BUFFER)
-                    val written = currentSink.write(pcmBuffer, pcmBuffer.size)
+                    val useLowPower = lowPowerMode
+                    val activeFramesPerBuffer = if (useLowPower) {
+                        FRAMES_PER_BUFFER_LOW_POWER
+                    } else {
+                        FRAMES_PER_BUFFER
+                    }
+                    val activeShortCount = activeFramesPerBuffer * 2
+                    val keepGoing = renderFrames(pcmBuffer, activeFramesPerBuffer)
+                    val written = currentSink.write(pcmBuffer, activeShortCount)
 
                     if (written < 0) {
                         consecutiveZeroWrites = 0
@@ -494,7 +552,8 @@ class DriftAudioMixerEngine(
                     } else if (written == 0) {
                         consecutiveZeroWrites++
                         if (consecutiveZeroWrites >= ZERO_WRITE_SPIN_THRESHOLD) {
-                            runCatching { Thread.sleep(ZERO_WRITE_SLEEP_MS) }
+                            val sleepMs = if (useLowPower) ZERO_WRITE_SLEEP_LOW_POWER_MS else ZERO_WRITE_SLEEP_MS
+                            runCatching { Thread.sleep(sleepMs) }
                         }
                     } else {
                         consecutiveZeroWrites = 0
@@ -531,6 +590,7 @@ class DriftAudioMixerEngine(
             }
             runCatching {
                 sinkFactory().also { fresh ->
+                    fresh.setLowPowerMode(lowPowerMode)
                     fresh.start()
                     sink = fresh
                 }

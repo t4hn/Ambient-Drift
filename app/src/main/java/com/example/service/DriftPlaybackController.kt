@@ -5,11 +5,13 @@ import android.content.Intent
 import android.os.SystemClock
 import android.util.Log
 import androidx.core.content.ContextCompat
+import com.example.audio.AndroidPowerSaveMonitor
 import com.example.audio.AudioFocusClient
 import com.example.audio.AudioFocusHelper
 import com.example.audio.AudioFocusListener
 import com.example.audio.DriftAudioMixerEngine
 import com.example.audio.FocusRequestOutcome
+import com.example.audio.PowerSaveMonitor
 import com.example.audio.WavStemLoader
 import com.example.data.PreferencesStorage
 import com.example.model.AudioSourceOrigin
@@ -44,12 +46,19 @@ class DriftPlaybackController(
     private val enableAndroidServiceBridge: Boolean = true,
     private val elapsedRealtimeMs: () -> Long = { SystemClock.elapsedRealtime() },
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
-    private val mainDispatcher: CoroutineDispatcher = Dispatchers.Main.immediate
+    private val mainDispatcher: CoroutineDispatcher = Dispatchers.Main.immediate,
+    private val powerSaveMonitor: PowerSaveMonitor? = if (enableAndroidServiceBridge) {
+        AndroidPowerSaveMonitor(appContext)
+    } else {
+        null
+    }
 ) : AudioFocusListener {
 
     companion object {
         private const val TAG = "DriftPlaybackController"
         const val SLEEP_FADE_DURATION_SECONDS = 8.0f
+        private const val BATTERY_SAVER_SLEEP_TIMER_TICK_MS = 5_000L
+        private const val BATTERY_SAVER_FINE_TIMER_WINDOW_MS = 60_000L
     }
 
     private val scope = CoroutineScope(SupervisorJob() + mainDispatcher)
@@ -67,6 +76,7 @@ class DriftPlaybackController(
     private var persistMasterVolumeJob: Job? = null
     private var sceneLoadJob: Job? = null
     private var transitionResetJob: Job? = null
+    private var powerSaveJob: Job? = null
     private val sceneLoadMutex = Mutex()
     private var sceneGeneration = 0L
     private var stateChangeListener: (() -> Unit)? = null
@@ -86,9 +96,10 @@ class DriftPlaybackController(
                 smoothCrossfadeEnabled = true,
                 channelVolumes = emptyMap(),
                 channelMutes = emptyMap(),
-                channelPlaybackStates = emptyMap()
+                channelPlaybackStates = emptyMap(),
+                batterySaverOptimizationEnabled = true
             )
-        )
+        ).copy(isDevicePowerSaveMode = powerSaveMonitor?.isPowerSaveMode?.value == true)
     )
     val uiState: StateFlow<DriftPlaybackUiState> = _uiState.asStateFlow()
 
@@ -100,6 +111,17 @@ class DriftPlaybackController(
         mixerEngine.setOnPlaybackErrorListener {
             scope.launch {
                 stopAll()
+            }
+        }
+        powerSaveMonitor?.let { monitor ->
+            monitor.start()
+            _uiState.update { it.copy(isDevicePowerSaveMode = monitor.isPowerSaveMode.value) }
+            applyBatterySaverAudioMode()
+            powerSaveJob = scope.launch {
+                monitor.isPowerSaveMode.collect { isPowerSave ->
+                    _uiState.update { it.copy(isDevicePowerSaveMode = isPowerSave) }
+                    applyBatterySaverAudioMode()
+                }
             }
         }
         scope.launch {
@@ -120,9 +142,11 @@ class DriftPlaybackController(
                         masterVolume = loaded.masterVolume,
                         autoPlayOnSceneSwitch = loaded.autoPlayOnSceneSwitch,
                         smoothCrossfadeEnabled = loaded.smoothCrossfadeEnabled,
+                        batterySaverOptimizationEnabled = loaded.batterySaverOptimizationEnabled,
                         hasTestAudioStems = scene.channels.any { ch -> ch.sourceOrigin == AudioSourceOrigin.SYNTHESIZED_TEST }
                     )
                 }
+                applyBatterySaverAudioMode()
                 withContext(ioDispatcher) {
                     mixerEngine.loadScene(
                         scene = scene,
@@ -556,6 +580,20 @@ class DriftPlaybackController(
         }
     }
 
+    fun setBatterySaverOptimizationEnabled(enabled: Boolean) {
+        hasUserInteracted = true
+        _uiState.update { it.copy(batterySaverOptimizationEnabled = enabled) }
+        cachedPrefs = cachedPrefs?.copy(batterySaverOptimizationEnabled = enabled)
+        applyBatterySaverAudioMode()
+        scope.launch(ioDispatcher) {
+            preferences.setBatterySaverOptimizationEnabled(enabled)
+        }
+    }
+
+    private fun applyBatterySaverAudioMode() {
+        mixerEngine.setLowPowerMode(_uiState.value.isBatterySaverOptimizationActive)
+    }
+
     fun startSleepTimer(preset: SleepTimerPreset) {
         startSleepTimerSeconds(preset.totalSeconds, preset)
     }
@@ -639,7 +677,16 @@ class DriftPlaybackController(
                     triggerSleepTimerExpiryFade(timerGen, fadeDurationSeconds)
                     break
                 }
-                delay(1000L)
+                val tickIntervalMs = if (
+                    _uiState.value.isBatterySaverOptimizationActive &&
+                    remainingMs > BATTERY_SAVER_FINE_TIMER_WINDOW_MS
+                ) {
+                    val excessAboveWindow = remainingMs - BATTERY_SAVER_FINE_TIMER_WINDOW_MS
+                    minOf(BATTERY_SAVER_SLEEP_TIMER_TICK_MS, excessAboveWindow).coerceAtLeast(1000L)
+                } else {
+                    1000L
+                }
+                delay(tickIntervalMs)
             }
         }
     }
@@ -731,6 +778,8 @@ class DriftPlaybackController(
     }
 
     fun release() {
+        powerSaveJob?.cancel()
+        powerSaveMonitor?.stop()
         sceneLoadJob?.cancel()
         transitionResetJob?.cancel()
         sleepTimerJob?.cancel()
@@ -767,7 +816,8 @@ class DriftPlaybackController(
             playbackStatus = PlaybackStatus.STOPPED,
             autoPlayOnSceneSwitch = prefs.autoPlayOnSceneSwitch,
             smoothCrossfadeEnabled = prefs.smoothCrossfadeEnabled,
-            hasTestAudioStems = scene.channels.any { it.sourceOrigin == AudioSourceOrigin.SYNTHESIZED_TEST }
+            hasTestAudioStems = scene.channels.any { it.sourceOrigin == AudioSourceOrigin.SYNTHESIZED_TEST },
+            batterySaverOptimizationEnabled = prefs.batterySaverOptimizationEnabled
         )
     }
 

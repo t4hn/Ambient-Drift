@@ -71,7 +71,8 @@ data class UserPreferences(
     val smoothCrossfadeEnabled: Boolean,
     val channelVolumes: Map<String, Float>,
     val channelMutes: Map<String, Boolean>,
-    val channelPlaybackStates: Map<String, Boolean>
+    val channelPlaybackStates: Map<String, Boolean>,
+    val batterySaverOptimizationEnabled: Boolean = true
 )
 
 data class DriftPlaybackUiState(
@@ -84,8 +85,13 @@ data class DriftPlaybackUiState(
     val sleepTimer: SleepTimerState = SleepTimerState(),
     val autoPlayOnSceneSwitch: Boolean = true,
     val smoothCrossfadeEnabled: Boolean = true,
-    val hasTestAudioStems: Boolean = true
+    val hasTestAudioStems: Boolean = true,
+    val batterySaverOptimizationEnabled: Boolean = true,
+    val isDevicePowerSaveMode: Boolean = false
 ) {
     val isPlayingOrFading: Boolean
         get() = playbackStatus == PlaybackStatus.PLAYING || playbackStatus == PlaybackStatus.FADING_OUT
+
+    val isBatterySaverOptimizationActive: Boolean
+        get() = batterySaverOptimizationEnabled && isDevicePowerSaveMode
 }

@@ -53,6 +53,7 @@ class DriftPhase2a1RegressionTest {
         var masterVolume: Float = 0.85f
         var autoPlay: Boolean = true
         var crossfade: Boolean = true
+        var batterySaverOptimization: Boolean = true
         val channelVolumes = mutableMapOf<String, Float>()
         val channelMutes = mutableMapOf<String, Boolean>()
         val channelPlayStates = mutableMapOf<String, Boolean>()
@@ -67,7 +68,8 @@ class DriftPhase2a1RegressionTest {
             smoothCrossfadeEnabled = crossfade,
             channelVolumes = channelVolumes.toMap(),
             channelMutes = channelMutes.toMap(),
-            channelPlaybackStates = channelPlayStates.toMap()
+            channelPlaybackStates = channelPlayStates.toMap(),
+            batterySaverOptimizationEnabled = batterySaverOptimization
         )
 
         override suspend fun readInitialPreferences(): UserPreferences = snapshot()
@@ -104,6 +106,11 @@ class DriftPhase2a1RegressionTest {
 
         override suspend fun setSmoothCrossfadeEnabled(enabled: Boolean) {
             crossfade = enabled
+            flow.value = snapshot()
+        }
+
+        override suspend fun setBatterySaverOptimizationEnabled(enabled: Boolean) {
+            batterySaverOptimization = enabled
             flow.value = snapshot()
         }
 

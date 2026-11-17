@@ -317,6 +317,9 @@ fun DriftApp(
                                     },
                                     onAutoPlayChange = { viewModel.setAutoPlayOnSceneSwitch(it) },
                                     onSmoothCrossfadeChange = { viewModel.setSmoothCrossfadeEnabled(it) },
+                                    onBatterySaverOptimizationChange = {
+                                        viewModel.setBatterySaverOptimizationEnabled(it)
+                                    },
                                     onResetAllMixes = { viewModel.resetAllToDefaults() }
                                 )
                             }

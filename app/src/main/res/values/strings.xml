@@ -52,6 +52,7 @@
     <string name="mixer_mute_cd">Toggle mute for %1$s</string>
     <string name="mixer_channel_play_cd">Toggle playback for %1$s</string>
     <string name="mixer_test_audio_badge">TEST AUDIO STEMS • OFFLINE</string>
+    <string name="mixer_battery_saver_badge">ECO BUFFER</string>
 
     <!-- Sleep Timer -->
     <string name="sleep_timer_title">Sleep Timer</string>
@@ -71,6 +72,10 @@
     <string name="settings_auto_resume_desc">Automatically begin playing when selecting a new soundscape.</string>
     <string name="settings_crossfade_title">Smooth scene crossfade</string>
     <string name="settings_crossfade_desc">Gradually blend between scenes over 1.2 seconds when switching.</string>
+    <string name="settings_battery_saver_title">Battery saver audio efficiency</string>
+    <string name="settings_battery_saver_active">Active now • Larger audio buffers &amp; reduced background wakeups</string>
+    <string name="settings_battery_saver_desc">Lower audio buffer frequency and background thread usage when device Battery Saver is on.</string>
+    <string name="settings_battery_saver_disabled">Disabled • Using standard audio buffer frequency</string>
     <string name="settings_notifications_title">Background playback notifications</string>
     <string name="settings_notifications_granted">Enabled for lock screen &amp; background controls</string>
     <string name="settings_notifications_denied">Tap to allow lock screen media controls</string>

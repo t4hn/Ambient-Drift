@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.AudioFile
+import androidx.compose.material.icons.outlined.BatterySaver
 import androidx.compose.material.icons.outlined.GraphicEq
 import androidx.compose.material.icons.outlined.NotificationsActive
 import androidx.compose.material.icons.outlined.NotificationsOff
@@ -61,6 +62,7 @@ fun SettingsScreen(
     onRequestNotificationPermission: () -> Unit,
     onAutoPlayChange: (Boolean) -> Unit,
     onSmoothCrossfadeChange: (Boolean) -> Unit,
+    onBatterySaverOptimizationChange: (Boolean) -> Unit,
     onResetAllMixes: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -109,6 +111,22 @@ fun SettingsScreen(
                     checked = uiState.smoothCrossfadeEnabled,
                     onCheckedChange = onSmoothCrossfadeChange,
                     testTag = "setting_crossfade_switch"
+                )
+            }
+
+            item {
+                val batterySubtitle = when {
+                    !uiState.batterySaverOptimizationEnabled -> stringResource(R.string.settings_battery_saver_disabled)
+                    uiState.isBatterySaverOptimizationActive -> stringResource(R.string.settings_battery_saver_active)
+                    else -> stringResource(R.string.settings_battery_saver_desc)
+                }
+                SettingsToggleRow(
+                    icon = Icons.Outlined.BatterySaver,
+                    title = stringResource(R.string.settings_battery_saver_title),
+                    subtitle = batterySubtitle,
+                    checked = uiState.batterySaverOptimizationEnabled,
+                    onCheckedChange = onBatterySaverOptimizationChange,
+                    testTag = "setting_battery_saver_switch"
                 )
             }
 

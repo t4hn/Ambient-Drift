@@ -25,6 +25,7 @@ import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.outlined.BatterySaver
 import androidx.compose.material.icons.outlined.Bedtime
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -279,21 +280,53 @@ private fun SceneHeroHeader(
                     }
                     val statusActive = uiState.isPlayingOrFading
 
-                    Surface(
-                        shape = CircleShape,
-                        color = if (statusActive) DriftEmeraldContainer else Color(0xCC111A1D),
-                        border = BorderStroke(
-                            1.dp,
-                            if (statusActive) DriftEmerald else DriftBorderSubtle
-                        ),
-                        modifier = Modifier.testTag("mixer_playback_status")
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(
-                            text = statusText.uppercase(),
-                            style = MaterialTheme.typography.labelSmall,
-                            color = if (statusActive) DriftOnEmeraldContainer else DriftTextSecondary,
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-                        )
+                        if (uiState.isBatterySaverOptimizationActive) {
+                            Surface(
+                                shape = CircleShape,
+                                color = Color(0xCC0D231C),
+                                border = BorderStroke(1.dp, DriftEmerald.copy(alpha = 0.6f)),
+                                modifier = Modifier.testTag("mixer_battery_saver_badge")
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Outlined.BatterySaver,
+                                        contentDescription = stringResource(R.string.mixer_battery_saver_badge),
+                                        tint = DriftEmerald,
+                                        modifier = Modifier.size(12.dp)
+                                    )
+                                    Text(
+                                        text = stringResource(R.string.mixer_battery_saver_badge),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = DriftEmerald
+                                    )
+                                }
+                            }
+                        }
+
+                        Surface(
+                            shape = CircleShape,
+                            color = if (statusActive) DriftEmeraldContainer else Color(0xCC111A1D),
+                            border = BorderStroke(
+                                1.dp,
+                                if (statusActive) DriftEmerald else DriftBorderSubtle
+                            ),
+                            modifier = Modifier.testTag("mixer_playback_status")
+                        ) {
+                            Text(
+                                text = statusText.uppercase(),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (statusActive) DriftOnEmeraldContainer else DriftTextSecondary,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                            )
+                        }
                     }
                 }
 

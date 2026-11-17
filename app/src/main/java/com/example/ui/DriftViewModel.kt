@@ -67,6 +67,10 @@ class DriftViewModel(application: Application) : AndroidViewModel(application) {
         controller.setSmoothCrossfadeEnabled(enabled)
     }
 
+    fun setBatterySaverOptimizationEnabled(enabled: Boolean) {
+        controller.setBatterySaverOptimizationEnabled(enabled)
+    }
+
     fun startSleepTimer(preset: SleepTimerPreset) {
         controller.startSleepTimer(preset)
     }

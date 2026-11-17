@@ -29,6 +29,7 @@ interface PreferencesStorage {
     suspend fun setChannelPlaying(channelId: String, playing: Boolean)
     suspend fun setAutoPlayOnSceneSwitch(enabled: Boolean)
     suspend fun setSmoothCrossfadeEnabled(enabled: Boolean)
+    suspend fun setBatterySaverOptimizationEnabled(enabled: Boolean)
     suspend fun resetSceneDefaults(scene: SceneSpec)
     suspend fun resetAllDefaults(scenes: List<SceneSpec>)
 }
@@ -42,6 +43,7 @@ class DriftPreferencesRepository(
         val MASTER_VOLUME = floatPreferencesKey("master_volume")
         val AUTO_PLAY_ON_SWITCH = booleanPreferencesKey("auto_play_on_scene_switch")
         val SMOOTH_CROSSFADE = booleanPreferencesKey("smooth_crossfade_enabled")
+        val BATTERY_SAVER_OPTIMIZATION = booleanPreferencesKey("battery_saver_optimization_enabled")
 
         fun channelVolume(channelId: String) = floatPreferencesKey("vol_$channelId")
         fun channelMute(channelId: String) = booleanPreferencesKey("mute_$channelId")
@@ -81,7 +83,8 @@ class DriftPreferencesRepository(
             smoothCrossfadeEnabled = prefs[Keys.SMOOTH_CROSSFADE] ?: true,
             channelVolumes = volumes,
             channelMutes = mutes,
-            channelPlaybackStates = playStates
+            channelPlaybackStates = playStates,
+            batterySaverOptimizationEnabled = prefs[Keys.BATTERY_SAVER_OPTIMIZATION] ?: true
         )
     }
 
@@ -111,6 +114,10 @@ class DriftPreferencesRepository(
 
     override suspend fun setSmoothCrossfadeEnabled(enabled: Boolean) {
         context.driftDataStore.edit { it[Keys.SMOOTH_CROSSFADE] = enabled }
+    }
+
+    override suspend fun setBatterySaverOptimizationEnabled(enabled: Boolean) {
+        context.driftDataStore.edit { it[Keys.BATTERY_SAVER_OPTIMIZATION] = enabled }
     }
 
     override suspend fun resetSceneDefaults(scene: SceneSpec) {
